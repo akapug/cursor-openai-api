@@ -3,7 +3,7 @@
  *
  * Serves Cursor API as OpenAI-compatible endpoint with OAuth authentication.
  */
-import { login, logout, getStoredCredentials, isAuthenticated } from "./cli-auth";
+import { login, logout, getStoredCredentials, isAuthenticated, refreshCursorToken, saveCredentials } from "./cli-auth";
 import { startProxy, stopProxy, getProxyPort } from "./proxy";
 import { getCursorModels } from "./models";
 import { getTokenExpiry } from "./auth";
@@ -67,6 +67,21 @@ async function cmdModels() {
 }
 
 async function cmdServe(port: number) {
+  // helm patch (2026-08-11): upstream cmdServe captured `creds.access` ONCE,
+  // so a long-running serve outlived its access token and every request then
+  // failed until a manual restart — the refresh helper existed but nothing in
+  // the serve path called it. Re-read the store per request and refresh
+  // through the stored refresh token when the access token is within 60s of
+  // expiry (or past it): one owner login, then the bridge keeps itself live.
+  const getAccessToken = async (): Promise<string> => {
+    const c = getStoredCredentials();
+    if (!c) throw new Error("Not logged in. Run `cursor-api login` first.");
+    if (c.expires > Date.now() + 60_000) return c.access;
+    const fresh = await refreshCursorToken(c.refresh);
+    saveCredentials(fresh);
+    return fresh.access;
+  };
+
   const creds = getStoredCredentials();
   if (!creds) {
     console.log("❌ Not logged in. Run `cursor-api login` first.");
@@ -74,8 +89,13 @@ async function cmdServe(port: number) {
   }
 
   if (creds.expires < Date.now()) {
-    console.log("⚠️  Token expired. Run `cursor-api login` to re-authenticate.");
-    process.exit(1);
+    try {
+      await getAccessToken();
+      console.log("🔄 Stored token was expired; refreshed via refresh token.");
+    } catch {
+      console.log("⚠️  Token expired and refresh failed. Run `cursor-api login` to re-authenticate.");
+      process.exit(1);
+    }
   }
 
   console.log(`🚀 Starting Cursor OpenAI API proxy on port ${port}...`);
@@ -83,7 +103,7 @@ async function cmdServe(port: number) {
   console.log(`   Models: http://localhost:${port}/v1/models`);
   console.log(`   Press Ctrl+C to stop.\n`);
 
-  const proxyPort = await startProxy(async () => creds.access, port);
+  const proxyPort = await startProxy(getAccessToken, port);
 
   console.log(`✅ Server running at http://localhost:${proxyPort}\n`);
 
