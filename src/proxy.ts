@@ -1307,7 +1307,18 @@ async function collectFullResponse(
   accessToken: string,
 ): Promise<string> {
   const { promise, resolve } = Promise.withResolvers<string>();
-  let fullText = "";
+  // helm patch (2026-08-11): THINKING AND ANSWER ARE TWO STREAMS AND THIS
+  // PATH USED TO SPLICE THEM INTO ONE STRING. processServerMessage reports
+  // which stream a delta belongs to (onText's second argument), and the SSE
+  // path uses it to fence reasoning in <think>…</think>; this collector
+  // passed `(text) => { fullText += text; }` and dropped the flag, so
+  // interleaved thinking/answer deltas shredded into each other MID-WORD.
+  // Measured live against cursor-grok-4.5-high: a one-sentence request came
+  // back "I am Cursor G 4.5.rok.I am Cursor Grok 4.5 and I am reachable."
+  // Keep the two apart, and return the ANSWER — an OpenAI-compatible
+  // message.content is the reply, not the scratchpad.
+  let answerText = "";
+  let thinkingText = "";
 
   const bridge = spawnBridge(accessToken);
 
@@ -1348,7 +1359,10 @@ async function collectFullResponse(
           payload.mcpTools,
           (data) => bridge.write(data),
           state,
-          (text) => { fullText += text; },
+          (text, isThinking) => {
+            if (isThinking) thinkingText += text;
+            else answerText += text;
+          },
           () => {},
         );
       } catch {
@@ -1359,7 +1373,15 @@ async function collectFullResponse(
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);
-    resolve(fullText);
+    // A turn that produced ONLY reasoning must not resolve empty: an empty
+    // 200 is the silent-swallow shape the proxy's own patches exist to kill,
+    // and it is indistinguishable from a dropped upstream. Fence it so the
+    // caller can see what it is rather than receiving nothing.
+    if (!answerText && thinkingText) {
+      resolve(`<think>${thinkingText}</think>`);
+      return;
+    }
+    resolve(answerText);
   });
 
   return promise;

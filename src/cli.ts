@@ -163,10 +163,22 @@ async function main() {
       await cmdModels();
       break;
     case "serve": {
-      const envPort = parseInt(process.env.PORT ?? "", 10);
-      const port = envPort || PROXY_PORT;
-      if (isNaN(port) || port < 1 || port > 65535) {
-        console.error(`Invalid port: ${process.env.PORT}. Using default ${PROXY_PORT}.`);
+      // helm patch (2026-08-11): the usage text and the README both advertise
+      // `serve [port]`, but only $PORT was ever read — a positional port was
+      // accepted in silence and ignored, so `serve 18330` bound 3000 and the
+      // caller learned it only from the banner. Positional wins (it is the
+      // most specific), then $PORT, then the default; an out-of-range value
+      // is refused loudly rather than silently downgraded to the default.
+      const raw = args[1] ?? process.env.PORT ?? "";
+      const source = args[1] ? "argument" : (process.env.PORT ? "$PORT" : "");
+      let port = PROXY_PORT;
+      if (raw) {
+        const parsed = parseInt(raw, 10);
+        if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
+          console.error(`Invalid port from ${source}: ${raw}`);
+          process.exit(2);
+        }
+        port = parsed;
       }
       await cmdServe(port);
       break;
