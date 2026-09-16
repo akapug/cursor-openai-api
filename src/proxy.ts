@@ -112,6 +112,16 @@ interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
+  /**
+   * helm patch (2026-09-16): character count of everything we send upstream.
+   * Cursor returns NO token counts, so the bridge reported no `usage` at all and
+   * CLIProxyAPI fell back to a hardcoded zero (openai_claude_response.go:405).
+   * A permanent usage of zero means Claude Code's autocompact — which keys on
+   * input_tokens — can NEVER fire, so the seat runs until it hits a hard context
+   * wall with no warning. An ESTIMATE is far better than a zero here: the number
+   * guards a context window, it is not billing.
+   */
+  promptChars: number;
 }
 
 /** A pending tool execution waiting for results from the caller. */
@@ -313,7 +323,7 @@ function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
 ): Response {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  let { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
 
@@ -346,6 +356,32 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
+  // helm patch (2026-09-16): TOOL RESULTS WERE SILENTLY DROPPED ON THE
+  // STATELESS PATH. Reaching here with toolResults means we hold no live
+  // bridge for them — the previous turn's stream already ended, the process
+  // restarted, or the key did not match. parseMessages routes tool output into
+  // `toolResults`, which only handleToolResultResume above consumes, so the
+  // fresh request we build below carried NEITHER the results NOR any mention
+  // of them. The model saw its own tool call with no output and concluded the
+  // tool was broken. MEASURED: it answered "The Bash MCP tool failed; running
+  // the same command with Shell." That is the whole reason a real seat could
+  // chat but never complete a task, because Claude Code sends every turn
+  // statelessly with the results in the history.
+  //
+  // Fold them into the outgoing message as plain text, the same move the
+  // history fold in buildCursorRequest makes for prior turns. A tool-result-
+  // only turn has no user text at all, so this is also what keeps it non-empty.
+  if (toolResults.length > 0) {
+    const rendered = toolResults
+      .map((r) => `<tool_result id="${r.toolCallId}">\n${r.content}\n</tool_result>`)
+      .join("\n");
+    userText = userText
+      ? `${rendered}\n\n${userText}`
+      : `The tool calls you requested have run. Their output:\n\n${rendered}\n\n` +
+        `Continue from here using that output.`;
+    toolResults = [];
+  }
+
   const mcpTools = buildMcpToolDefinitions(tools);
   const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
   payload.mcpTools = mcpTools;
@@ -370,6 +406,41 @@ interface ParsedMessages {
   toolResults: ToolResultInfo[];
 }
 
+/**
+ * helm patch (2026-09-16): CONTENT IS A STRING *OR* AN ARRAY OF BLOCKS, AND
+ * THIS FILE ASSUMED STRING EVERYWHERE. parseMessages read `msg.content ?? ""`
+ * directly, so an array reached the wire as the literal text "[object Object]".
+ * Claude Code sends array-form content on essentially every message, so a real
+ * seat's whole conversation — system prompt included — arrived at Cursor as
+ * that garbage string, and Cursor answered with Connect failed_precondition.
+ * MEASURED: a single {type:"text"} block made the model reply "Looks like the
+ * message didn't come through correctly ([object O…". Flatten to text here so
+ * every caller keeps its string contract.
+ */
+function contentToText(content: unknown): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (typeof block === "string") { parts.push(block); continue; }
+      if (!block || typeof block !== "object") continue;
+      const b = block as Record<string, unknown>;
+      if (typeof b.text === "string") { parts.push(b.text); continue; }
+      // tool_result blocks nest their payload one level deeper.
+      if (b.type === "tool_result" && b.content != null) {
+        parts.push(contentToText(b.content));
+        continue;
+      }
+      // Anything else (image, tool_use) has no text face; name it rather than
+      // dropping it silently, so a lost block is visible instead of invisible.
+      if (typeof b.type === "string") parts.push(`[${b.type}]`);
+    }
+    return parts.join("\n");
+  }
+  return String(content);
+}
+
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const pairs: Array<{ userText: string; assistantText: string }> = [];
@@ -378,7 +449,7 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   // Collect system messages
   const systemParts = messages
     .filter((m) => m.role === "system")
-    .map((m) => m.content ?? "");
+    .map((m) => contentToText(m.content));
   if (systemParts.length > 0) {
     systemPrompt = systemParts.join("\n");
   }
@@ -391,16 +462,16 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     if (msg.role === "tool") {
       toolResults.push({
         toolCallId: msg.tool_call_id ?? "",
-        content: msg.content ?? "",
+        content: contentToText(msg.content),
       });
     } else if (msg.role === "user") {
       if (pendingUser) {
         pairs.push({ userText: pendingUser, assistantText: "" });
       }
-      pendingUser = msg.content ?? "";
+      pendingUser = contentToText(msg.content);
     } else if (msg.role === "assistant") {
       // Skip assistant messages that are just tool_calls with no text
-      const text = msg.content ?? "";
+      const text = contentToText(msg.content);
       if (pendingUser) {
         pairs.push({ userText: pendingUser, assistantText: text });
         pendingUser = "";
@@ -466,7 +537,42 @@ function buildCursorRequest(
   userText: string,
   turns: Array<{ userText: string; assistantText: string }>,
 ): CursorRequestPayload {
+  /* eslint-disable prefer-const */
   const blobStore = new Map<string, Uint8Array>();
+  // helm patch (2026-09-16): see CursorRequestPayload.promptChars.
+  const promptChars = systemPrompt.length + userText.length +
+    turns.reduce((n, t) => n + t.userText.length + t.assistantText.length, 0);
+
+  // helm patch (2026-09-16): CURSOR REJECTS OUR RECONSTRUCTED HISTORY.
+  // MEASURED, isolated direct against the bridge with the proxy bypassed: a
+  // single user message succeeds, and ANY request carrying prior turns comes
+  // back "Connect error failed_precondition". One user/assistant pair is
+  // enough to trigger it, so it is the turn STRUCTURE we synthesise here, not
+  // size, tool count, consecutive user roles or content shape (each of those
+  // was tested and cleared separately). Cursor's own client presumably fills
+  // fields of AgentConversationTurnStructure that we leave at their defaults,
+  // and we have no spec for them.
+  //
+  // Until that shape is known, FOLD the history into the outgoing user message
+  // as a plain transcript and send NO structured turns. This loses Cursor-side
+  // turn metadata and costs prompt tokens, but it preserves every word of the
+  // conversation and it WORKS — the alternative is a seat that cannot hold a
+  // second exchange, which is no seat at all. A real Claude Code seat carries
+  // history on literally every request after its first.
+  const FOLD_HISTORY = true;
+  if (FOLD_HISTORY && turns.length > 0) {
+    const transcript = turns
+      .map((t) =>
+        `<turn>\n<user>\n${t.userText}\n</user>` +
+        (t.assistantText ? `\n<assistant>\n${t.assistantText}\n</assistant>` : "") +
+        `\n</turn>`
+      )
+      .join("\n");
+    userText =
+      `The conversation so far, for context:\n\n${transcript}\n\n` +
+      `The latest message, which is the one to answer:\n\n${userText}`;
+    turns = [];
+  }
 
   const turnBytes: Uint8Array[] = [];
   for (const turn of turns) {
@@ -552,6 +658,7 @@ function buildCursorRequest(
     requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
     blobStore,
     mcpTools: [],
+    promptChars,
   };
 }
 
@@ -588,6 +695,8 @@ interface StreamState {
   thinkingActive: boolean;
   toolCallIndex: number;
   pendingExecs: PendingExec[];
+  /** helm patch (2026-09-16): chars emitted upstream->client, for the usage estimate. */
+  outChars: number;
 }
 
 function processServerMessage(
@@ -865,7 +974,7 @@ function sendExecResult(
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
   // Use a hash of the first user message + model as a stable key.
   // This is imperfect but sufficient for single-session use.
-  const firstUser = messages.find((m) => m.role === "user")?.content ?? "";
+  const firstUser = contentToText(messages.find((m) => m.role === "user")?.content);
   return createHash("sha256")
     .update(`${modelId}:${firstUser.slice(0, 200)}`)
     .digest("hex")
@@ -886,19 +995,37 @@ function handleStreamingResponse(
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
+      // helm patch (2026-09-16): A CLIENT DISCONNECT USED TO KILL THE WHOLE
+      // BRIDGE PROCESS. The `closed` flag only tracks OUR OWN closes, so when
+      // the client hangs up mid-stream — pressing Esc in Claude Code is enough —
+      // the runtime closes the controller underneath us, `closed` is still
+      // false, and the next enqueue throws ERR_INVALID_STATE from inside a
+      // bridge.onClose callback. Nothing catches it there, so bun exits and
+      // EVERY seat on this bridge starts getting ECONNREFUSED. MEASURED: the
+      // owner interrupted one turn and the bridge died with
+      // "Invalid state: Controller is already closed" at the stop chunk.
+      // A dead stream is a normal end of life, never a fatal error.
       let closed = false;
-      const sendSSE = (data: object) => {
+      const safeEnqueue = (text: string) => {
         if (closed) return;
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        try {
+          controller.enqueue(encoder.encode(text));
+        } catch {
+          closed = true; // the peer is gone; stop writing, do not throw
+        }
+      };
+      const sendSSE = (data: object) => {
+        safeEnqueue(`data: ${JSON.stringify(data)}\n\n`);
       };
       const sendDone = () => {
-        if (closed) return;
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        safeEnqueue("data: [DONE]\n\n");
       };
       const closeController = () => {
         if (closed) return;
         closed = true;
-        controller.close();
+        try {
+          controller.close();
+        } catch { /* already closed by the runtime — not an error */ }
       };
 
       const makeChunk = (
@@ -916,6 +1043,7 @@ function handleStreamingResponse(
         thinkingActive: false,
         toolCallIndex: 0,
         pendingExecs: [],
+        outChars: 0,
       };
 
       let mcpExecReceived = false;
@@ -961,17 +1089,28 @@ function handleStreamingResponse(
               state,
               // onText
               (text, isThinking) => {
+                // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD,
+                // NOT FENCED TEXT. This used to emit literal "<think>" / "</think>"
+                // into `content`, so the reasoning arrived as ordinary assistant
+                // TEXT. Claude Code's TUI strips those spans, so every reasoning
+                // token rendered as a BLANK LINE while still being generated and
+                // billed — and a reasoning-only turn rendered as a completely
+                // empty response. Owner saw it live: "it looks like it's dropping
+                // tokens". `reasoning_content` on the delta is the OpenAI
+                // convention CLIProxyAPI already maps to an Anthropic thinking
+                // block (internal/translator/openai/claude/openai_claude_response.go:169),
+                // which is exactly how the ds4pro family renders correctly.
+                state.outChars += text.length;
                 if (isThinking) {
-                  if (!state.thinkingActive) {
-                    state.thinkingActive = true;
-                    sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
+                  const first = !state.thinkingActive;
+                  state.thinkingActive = true;
+                  sendSSE(makeChunk(
+                    first
+                      ? { role: "assistant", reasoning_content: text }
+                      : { reasoning_content: text },
+                  ));
                 } else {
-                  if (state.thinkingActive) {
-                    state.thinkingActive = false;
-                    sendSSE(makeChunk({ content: "</think>" }));
-                  }
+                  state.thinkingActive = false;
                   sendSSE(makeChunk({ content: text }));
                 }
               },
@@ -981,10 +1120,9 @@ function handleStreamingResponse(
                 mcpExecReceived = true;
 
                 // Close thinking if active
-                if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
-                  state.thinkingActive = false;
-                }
+                // helm patch (2026-09-16): no fence to close — reasoning now
+                // rides `reasoning_content`, so ending it is just a flag clear.
+                state.thinkingActive = false;
 
                 // Emit tool_calls with decoded arguments
                 const toolCallIndex = state.toolCallIndex++;
@@ -1027,10 +1165,19 @@ function handleStreamingResponse(
         clearInterval(heartbeatTimer);
         if (!mcpExecReceived) {
           // Normal completion — no pending tool calls
-          if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
-          }
-          sendSSE(makeChunk({}, "stop"));
+          // helm patch (2026-09-16): reasoning rides `reasoning_content`; no fence to close.
+          // helm patch (2026-09-16): Cursor returns no token counts, so without
+          // this the client gets usage {0,0} forever and autocompact never fires.
+          // ~4 chars per token is the standard rough heuristic; it guards a
+          // context window, it is not billing.
+          const stopChunk = makeChunk({}, "stop") as Record<string, unknown>;
+          stopChunk.usage = {
+            prompt_tokens: Math.ceil(payload.promptChars / 4),
+            completion_tokens: Math.ceil(state.outChars / 4),
+            total_tokens: Math.ceil((payload.promptChars + state.outChars) / 4),
+            helm_estimated: true,
+          };
+          sendSSE(stopChunk);
           sendDone();
           closeController();
         }
@@ -1060,6 +1207,9 @@ function handleToolResultResume(
   bridgeKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
+  // helm patch (2026-09-16): inbound size for the usage estimate on this path.
+  const resumePromptChars = toolResults.reduce(
+    (n, r) => n + (typeof r.content === "string" ? r.content.length : 0), 0);
 
   // Send mcpResult for each pending exec that has a matching tool result
   for (const exec of pendingExecs) {
@@ -1115,19 +1265,37 @@ function handleToolResultResume(
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
+      // helm patch (2026-09-16): A CLIENT DISCONNECT USED TO KILL THE WHOLE
+      // BRIDGE PROCESS. The `closed` flag only tracks OUR OWN closes, so when
+      // the client hangs up mid-stream — pressing Esc in Claude Code is enough —
+      // the runtime closes the controller underneath us, `closed` is still
+      // false, and the next enqueue throws ERR_INVALID_STATE from inside a
+      // bridge.onClose callback. Nothing catches it there, so bun exits and
+      // EVERY seat on this bridge starts getting ECONNREFUSED. MEASURED: the
+      // owner interrupted one turn and the bridge died with
+      // "Invalid state: Controller is already closed" at the stop chunk.
+      // A dead stream is a normal end of life, never a fatal error.
       let closed = false;
-      const sendSSE = (data: object) => {
+      const safeEnqueue = (text: string) => {
         if (closed) return;
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        try {
+          controller.enqueue(encoder.encode(text));
+        } catch {
+          closed = true; // the peer is gone; stop writing, do not throw
+        }
+      };
+      const sendSSE = (data: object) => {
+        safeEnqueue(`data: ${JSON.stringify(data)}\n\n`);
       };
       const sendDone = () => {
-        if (closed) return;
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        safeEnqueue("data: [DONE]\n\n");
       };
       const closeController = () => {
         if (closed) return;
         closed = true;
-        controller.close();
+        try {
+          controller.close();
+        } catch { /* already closed by the runtime — not an error */ }
       };
 
       const makeChunk = (
@@ -1145,6 +1313,7 @@ function handleToolResultResume(
         thinkingActive: false,
         toolCallIndex: 0,
         pendingExecs: [],
+        outChars: 0,
       };
 
       let mcpExecReceived = false;
@@ -1182,17 +1351,28 @@ function handleToolResultResume(
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {
+                // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD,
+                // NOT FENCED TEXT. This used to emit literal "<think>" / "</think>"
+                // into `content`, so the reasoning arrived as ordinary assistant
+                // TEXT. Claude Code's TUI strips those spans, so every reasoning
+                // token rendered as a BLANK LINE while still being generated and
+                // billed — and a reasoning-only turn rendered as a completely
+                // empty response. Owner saw it live: "it looks like it's dropping
+                // tokens". `reasoning_content` on the delta is the OpenAI
+                // convention CLIProxyAPI already maps to an Anthropic thinking
+                // block (internal/translator/openai/claude/openai_claude_response.go:169),
+                // which is exactly how the ds4pro family renders correctly.
+                state.outChars += text.length;
                 if (isThinking) {
-                  if (!state.thinkingActive) {
-                    state.thinkingActive = true;
-                    sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
+                  const first = !state.thinkingActive;
+                  state.thinkingActive = true;
+                  sendSSE(makeChunk(
+                    first
+                      ? { role: "assistant", reasoning_content: text }
+                      : { reasoning_content: text },
+                  ));
                 } else {
-                  if (state.thinkingActive) {
-                    state.thinkingActive = false;
-                    sendSSE(makeChunk({ content: "</think>" }));
-                  }
+                  state.thinkingActive = false;
                   sendSSE(makeChunk({ content: text }));
                 }
               },
@@ -1200,10 +1380,9 @@ function handleToolResultResume(
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
-                if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
-                  state.thinkingActive = false;
-                }
+                // helm patch (2026-09-16): no fence to close — reasoning now
+                // rides `reasoning_content`, so ending it is just a flag clear.
+                state.thinkingActive = false;
 
                 const toolCallIndex = state.toolCallIndex++;
                 sendSSE(makeChunk({
@@ -1244,10 +1423,21 @@ function handleToolResultResume(
       bridge.onClose(() => {
         clearInterval(heartbeatTimer);
         if (!mcpExecReceived) {
-          if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
-          }
-          sendSSE(makeChunk({}, "stop"));
+          // helm patch (2026-09-16): reasoning rides `reasoning_content`; no fence to close.
+          // helm patch (2026-09-16): Cursor returns no token counts, so without
+          // this the client gets usage {0,0} forever and autocompact never fires.
+          // ~4 chars per token is the standard rough heuristic; it guards a
+          // context window, it is not billing.
+          const stopChunk = makeChunk({}, "stop") as Record<string, unknown>;
+          stopChunk.usage = {
+            // helm patch (2026-09-16): this resume path has no `payload` in
+            // scope — its inbound text is the tool results being fed back.
+            prompt_tokens: Math.ceil(resumePromptChars / 4),
+            completion_tokens: Math.ceil(state.outChars / 4),
+            total_tokens: Math.ceil((resumePromptChars + state.outChars) / 4),
+            helm_estimated: true,
+          };
+          sendSSE(stopChunk);
           sendDone();
           closeController();
         }
@@ -1378,7 +1568,11 @@ async function collectFullResponse(
     // and it is indistinguishable from a dropped upstream. Fence it so the
     // caller can see what it is rather than receiving nothing.
     if (!answerText && thinkingText) {
-      resolve(`<think>${thinkingText}</think>`);
+      // helm patch (2026-09-16): this used to fence the text in <think>…</think>,
+      // which defeated its own purpose — Claude Code STRIPS those spans, so the
+      // anti-silent-swallow guard produced a response that rendered as EMPTY,
+      // the exact shape it exists to prevent. Say what happened in plain text.
+      resolve(`[reasoning-only turn: the model produced no answer, only the scratchpad below]\n\n${thinkingText}`);
       return;
     }
     resolve(answerText);
