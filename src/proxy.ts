@@ -141,6 +141,13 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
+  /**
+   * helm patch (2026-09-16, ds4pro review F4): the conversation's prompt size,
+   * carried across the tool round-trip. The resume path counted only the tool
+   * RESULT text, so reported input_tokens collapsed after any live-bridge tool
+   * call and autocompact went quiet precisely when the window was fullest.
+   */
+  promptChars: number;
   /** Resolve function to resume streaming after tool results are sent. */
   onResume: ((sendFrame: (data: Uint8Array) => void) => void) | null;
 }
@@ -1010,8 +1017,15 @@ function handleStreamingResponse(
         if (closed) return;
         try {
           controller.enqueue(encoder.encode(text));
-        } catch {
-          closed = true; // the peer is gone; stop writing, do not throw
+        } catch (err) {
+          // helm patch (2026-09-16, ds4pro review F5): do NOT swallow silently.
+          // A closed controller is the ordinary end of a stream; anything else
+          // is a real defect and used to be indistinguishable from it.
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!/closed|ERR_INVALID_STATE/i.test(msg)) {
+            console.error("[bridge] SSE enqueue failed, not a disconnect:", msg);
+          }
+          closed = true; // stop writing either way; never throw from a callback
         }
       };
       const sendSSE = (data: object) => {
@@ -1145,6 +1159,7 @@ function handleStreamingResponse(
                   blobStore: payload.blobStore,
                   mcpTools: payload.mcpTools,
                   pendingExecs: state.pendingExecs,
+                  promptChars: payload.promptChars,
                   onResume: null,
                 });
 
@@ -1207,6 +1222,7 @@ function handleToolResultResume(
   bridgeKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
+  const carriedPromptChars = active.promptChars;
   // helm patch (2026-09-16): inbound size for the usage estimate on this path.
   const resumePromptChars = toolResults.reduce(
     (n, r) => n + (typeof r.content === "string" ? r.content.length : 0), 0);
@@ -1280,8 +1296,15 @@ function handleToolResultResume(
         if (closed) return;
         try {
           controller.enqueue(encoder.encode(text));
-        } catch {
-          closed = true; // the peer is gone; stop writing, do not throw
+        } catch (err) {
+          // helm patch (2026-09-16, ds4pro review F5): do NOT swallow silently.
+          // A closed controller is the ordinary end of a stream; anything else
+          // is a real defect and used to be indistinguishable from it.
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!/closed|ERR_INVALID_STATE/i.test(msg)) {
+            console.error("[bridge] SSE enqueue failed, not a disconnect:", msg);
+          }
+          closed = true; // stop writing either way; never throw from a callback
         }
       };
       const sendSSE = (data: object) => {
@@ -1403,6 +1426,7 @@ function handleToolResultResume(
                   blobStore,
                   mcpTools,
                   pendingExecs: state.pendingExecs,
+                  promptChars: carriedPromptChars,
                   onResume: null,
                 });
 
@@ -1432,9 +1456,14 @@ function handleToolResultResume(
           stopChunk.usage = {
             // helm patch (2026-09-16): this resume path has no `payload` in
             // scope — its inbound text is the tool results being fed back.
-            prompt_tokens: Math.ceil(resumePromptChars / 4),
+            // helm patch (2026-09-16, ds4pro review F4): count the WHOLE
+            // conversation carried across the tool round-trip, not just the
+            // tool-result text. Counting only the results collapsed
+            // input_tokens after every tool call and silenced autocompact
+            // exactly when the context was fullest.
+            prompt_tokens: Math.ceil((carriedPromptChars + resumePromptChars) / 4),
             completion_tokens: Math.ceil(state.outChars / 4),
-            total_tokens: Math.ceil((resumePromptChars + state.outChars) / 4),
+            total_tokens: Math.ceil((carriedPromptChars + resumePromptChars + state.outChars) / 4),
             helm_estimated: true,
           };
           sendSSE(stopChunk);
@@ -1523,6 +1552,7 @@ async function collectFullResponse(
     thinkingActive: false,
     toolCallIndex: 0,
     pendingExecs: [],
+    outChars: 0,
   };
 
   bridge.onData((incoming) => {
