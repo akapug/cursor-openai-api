@@ -326,10 +326,10 @@ export function stopProxy(): void {
 
 // --- Chat Completion Handler ---
 
-function handleChatCompletion(
+async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
-): Response {
+): Promise<Response> {
   let { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
@@ -686,6 +686,70 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
   }
 }
 
+// helm patch (2026-09-16): CURSOR'S QUOTA REFUSAL MUST BE A 429, NOT TEXT.
+// A walled account answers with a Connect end-stream whose error.code is
+// resource_exhausted (unavailable has the same shape). Emitting that as
+// message content under HTTP 200 made every walled turn look like a finished
+// answer: the proxy never cooled the credential, helm never read a wall, and
+// the seat respawned reviewers that each died the same way (measured on the
+// cursor seat, 2026-09-16). The fresh-request path now PEEKS at the first
+// frame before committing to an SSE 200; a refusal there becomes a real 429
+// with Retry-After, which CLIProxyAPI cools on and helm surfaces as
+// PROXY-COOLDOWN. A refusal mid-stream, after content, still lands as text:
+// the status line is already gone by then.
+const PEEK_FIRST_FRAME_MS = 15_000;
+const CONNECT_REFUSAL_CODES = new Set(["resource_exhausted", "unavailable"]);
+
+function connectRefusal(err: Error): { code: string; message: string } | null {
+  const m = /^Connect error ([a-z_]+): ([\s\S]*)$/.exec(err.message);
+  if (!m) return null;
+  const code = m[1]!;
+  return CONNECT_REFUSAL_CODES.has(code) ? { code, message: m[2]! } : null;
+}
+
+type FirstFramePeek = {
+  buf: Buffer;
+  refusal: { code: string; message: string } | null;
+  closedCode: number | null;
+};
+
+// Accumulates bridge output until ONE complete Connect frame is present (or
+// the bridge closes, or the timeout passes). Everything received stays in
+// `buf` — including bytes that arrive after resolution — so the stream that
+// takes over reads `buf` at handover and loses nothing.
+function peekFirstFrame(
+  bridge: ReturnType<typeof spawnBridge>,
+  timeoutMs: number,
+): Promise<FirstFramePeek> {
+  const peek: FirstFramePeek = { buf: Buffer.alloc(0), refusal: null, closedCode: null };
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(peek);
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    bridge.onData((chunk) => {
+      peek.buf = Buffer.concat([peek.buf, chunk]);
+      if (done || peek.buf.length < 5) return;
+      const flags = peek.buf[0]!;
+      const msgLen = peek.buf.readUInt32BE(1);
+      if (peek.buf.length < 5 + msgLen) return;
+      if (flags & CONNECT_END_STREAM_FLAG) {
+        const err = parseConnectEndStream(peek.buf.subarray(5, 5 + msgLen));
+        peek.refusal = err ? connectRefusal(err) : null;
+      }
+      finish();
+    });
+    bridge.onClose((code) => {
+      peek.closedCode = code;
+      finish();
+    });
+  });
+}
+
 function makeHeartbeatBytes(): Uint8Array {
   const heartbeat = create(AgentClientMessageSchema, {
     message: {
@@ -990,14 +1054,36 @@ function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
 
 // --- Streaming Handler ---
 
-function handleStreamingResponse(
+async function handleStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
   bridgeKey: string,
-): Response {
+): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+
+  const bridge = spawnBridge(accessToken);
+  bridge.write(frameConnectMessage(payload.requestBytes));
+  const heartbeatTimer = setInterval(() => {
+    bridge.write(makeHeartbeatBytes());
+  }, 5_000);
+  const peeked = await peekFirstFrame(bridge, PEEK_FIRST_FRAME_MS);
+  if (peeked.refusal) {
+    clearInterval(heartbeatTimer);
+    bridge.end();
+    console.error(`[bridge] upstream refusal on first frame: ${peeked.refusal.code} -> 429`);
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: `Connect error ${peeked.refusal.code}: ${peeked.refusal.message}`,
+          type: "rate_limit_error",
+          code: peeked.refusal.code,
+        },
+      }),
+      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "60" } },
+    );
+  }
 
   const stream = new ReadableStream({
     start(controller) {
@@ -1062,14 +1148,10 @@ function handleStreamingResponse(
 
       let mcpExecReceived = false;
 
-      const bridge = spawnBridge(accessToken);
-      bridge.write(frameConnectMessage(payload.requestBytes));
-
-      const heartbeatTimer = setInterval(() => {
-        bridge.write(makeHeartbeatBytes());
-      }, 5_000);
-
-      let pendingBuffer = Buffer.alloc(0);
+      // helm patch (2026-09-16): the bridge was spawned and its first frame
+      // peeked before this Response existed (see peekFirstFrame); take over
+      // the bytes it already holds, in order, before any new chunk lands.
+      let pendingBuffer = peeked.buf;
 
       const processChunk = (incoming: Buffer) => {
         pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
@@ -1176,7 +1258,7 @@ function handleStreamingResponse(
 
       bridge.onData(processChunk);
 
-      bridge.onClose(() => {
+      const onBridgeClose = () => {
         clearInterval(heartbeatTimer);
         if (!mcpExecReceived) {
           // Normal completion — no pending tool calls
@@ -1197,7 +1279,10 @@ function handleStreamingResponse(
           closeController();
         }
         // If mcpExecReceived, we already closed the controller in onMcpExec
-      });
+      };
+      bridge.onClose(onBridgeClose);
+      if (pendingBuffer.length) processChunk(Buffer.alloc(0));
+      if (peeked.closedCode !== null) onBridgeClose();
     },
   });
 
@@ -1610,3 +1695,7 @@ async function collectFullResponse(
 
   return promise;
 }
+
+// helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
+// are exported for test/refusal-to-429.test.ts only.
+export const __test = { peekFirstFrame, connectRefusal };
