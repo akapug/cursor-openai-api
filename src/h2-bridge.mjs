@@ -92,7 +92,11 @@ const client = http2.connect(url || "https://api2.cursor.sh");
 // streaming, paused or abandoned; this child ends when the parent closes
 // stdin, when Cursor ends the stream, or on a transport error, and says why
 // on stderr.
+let closing = false;
 const fail = (what, err) => {
+  // Tearing the session down on purpose can still surface a stream error
+  // (a GOAWAY racing the close); that is the shutdown we asked for.
+  if (closing) process.exit(0);
   process.stderr.write(`[h2] ${what}: ${err?.code ?? ""} ${err?.message ?? err}\n`);
   process.exit(1);
 };
@@ -136,6 +140,7 @@ h2Stream.on("error", (err) => {
       // EOF or zero-length = the parent is done with this run. Close our half
       // and leave: before, the loop just stopped reading and the child stayed
       // up holding the Cursor stream until Cursor or the old timer ended it.
+      closing = true;
       if (!h2Stream.closed && !h2Stream.destroyed) h2Stream.close();
       client.close();
       setTimeout(() => process.exit(0), 100);
