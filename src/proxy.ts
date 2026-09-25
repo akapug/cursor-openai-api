@@ -57,6 +57,7 @@ import {
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  ShellStreamSchema,
   UserMessageActionSchema,
   UserMessageSchema,
   WriteRejectedSchema,
@@ -1142,18 +1143,26 @@ function handleExecMessage(
   }
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const args = execMsg.message.value;
-    const result = create(ShellResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ShellRejectedSchema, {
-          command: args.command ?? "",
-          workingDirectory: args.workingDirectory ?? "",
-          reason: REJECT_REASON,
-          isReadonly: false,
-        }),
-      },
+    const rejected = create(ShellRejectedSchema, {
+      command: args.command ?? "",
+      workingDirectory: args.workingDirectory ?? "",
+      reason: REJECT_REASON,
+      isReadonly: false,
     });
-    sendExecResult(execMsg, "shellResult", result, sendFrame);
+    // helm patch (2026-09-25): A STREAMED SHELL IS ANSWERED ON THE STREAM
+    // CHANNEL. shell_stream_args expects ExecClientMessage.shell_stream (a
+    // ShellStream event); this sent shell_result, which Cursor does not read
+    // for that exec, so it waited on an answer that never came. MEASURED on
+    // grok-4.7-high: the model reached for Cursor's own shell, the bridge
+    // "rejected" it with the wrong message, and the turn sat on heartbeats
+    // until the HTTP idle timeout cut it at 254 s ("unexpected EOF").
+    if (execCase === "shellStreamArgs") {
+      sendExecResult(execMsg, "shellStream",
+        create(ShellStreamSchema, { event: { case: "rejected", value: rejected } }), sendFrame);
+    } else {
+      sendExecResult(execMsg, "shellResult",
+        create(ShellResultSchema, { result: { case: "rejected", value: rejected } }), sendFrame);
+    }
     return;
   }
   if (execCase === "backgroundShellSpawnArgs") {
