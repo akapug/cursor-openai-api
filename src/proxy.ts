@@ -276,11 +276,13 @@ const limits = {
    */
   pausedTtlMs: 15 * 60_000,
   /**
-   * helm patch (2026-09-25): while a client is attached and waiting, Cursor
-   * sends SOMETHING every few seconds — deltas, or an interaction heartbeat
-   * about every 10 s even when it is stuck. This much silence means the
-   * stream is dead, and the client is told so in words instead of hanging
-   * until an idle timeout turns it into an empty 500.
+   * helm patch (2026-09-25): while a client is attached and waiting, a live
+   * run makes PROGRESS — deltas, checkpoints, execs. Heartbeats do not count:
+   * MEASURED, Cursor sends an interaction heartbeat every 10 s exactly while
+   * it waits on an exec answer the bridge never sends, so a stuck run is
+   * never silent. This long with nothing but heartbeats means the run is
+   * stuck, and the client is told so in words instead of hanging until the
+   * HTTP idle timeout turns the turn into "unexpected EOF".
    */
   stallMs: 90_000,
 };
@@ -1338,6 +1340,7 @@ function listen(run: Run, peeked: FirstFramePeek): void {
 }
 
 function feed(run: Run, chunk: Buffer): void {
+  let progressed = false;
   run.pending = Buffer.concat([run.pending, chunk]);
   while (run.pending.length >= 5) {
     const flags = run.pending[0]!;
@@ -1347,6 +1350,7 @@ function feed(run: Run, chunk: Buffer): void {
     run.pending = run.pending.subarray(5 + msgLen);
 
     if (flags & CONNECT_END_STREAM_FLAG) {
+      progressed = true;
       const endError = parseConnectEndStream(messageBytes);
       if (endError) {
         console.error(`[bridge] run ${run.id}: ${endError.message}`);
@@ -1355,8 +1359,12 @@ function feed(run: Run, chunk: Buffer): void {
       continue;
     }
     try {
+      const msg = fromBinary(AgentServerMessageSchema, messageBytes);
+      if (!(msg.message.case === "interactionUpdate" && msg.message.value.message.case === "heartbeat")) {
+        progressed = true;
+      }
       processServerMessage(
-        fromBinary(AgentServerMessageSchema, messageBytes),
+        msg,
         run.blobStore,
         run.mcpTools,
         (data) => run.bridge.write(data),
@@ -1374,7 +1382,7 @@ function feed(run: Run, chunk: Buffer): void {
   // Execs that arrive in one chunk are one batch: pause once, after all of
   // them are on the wire, so parallel tool calls reach the client together.
   if (run.pauseAfterChunk) pause(run);
-  armStall(run);
+  if (progressed || !run.sink) armStall(run);
 }
 
 /** (Re)start the silence watchdog while a client waits on this run; clear it otherwise. */
@@ -1383,7 +1391,7 @@ function armStall(run: Run): void {
   run.stall = null;
   if (!run.sink || run.closed) return;
   run.stall = setTimeout(() => {
-    emitText(run, `\n[Error: Cursor sent nothing for ${limits.stallMs / 1000} s; the bridge ended this run]`, false);
+    emitText(run, `\n[Error: Cursor made no progress for ${limits.stallMs / 1000} s (heartbeats only); the bridge ended this run]`, false);
     endRun(run, "stalled");
   }, limits.stallMs);
 }

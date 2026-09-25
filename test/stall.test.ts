@@ -3,7 +3,7 @@
 // timeout turns the turn into an empty 500.
 import { afterEach, describe, expect, test } from "bun:test";
 import { __test } from "../src/proxy";
-import { fakeBridge, frame, makeRun, readSse, textDelta } from "./helpers";
+import { fakeBridge, frame, heartbeat, makeRun, readSse, textDelta } from "./helpers";
 
 const NO_PEEK = { buf: Buffer.alloc(0), refusal: null, closedCode: null };
 const saved = { ...__test.limits };
@@ -18,8 +18,21 @@ describe("stall watchdog", () => {
     fb.feed(frame(textDelta("partial answer")));
     const s = await readSse(resp);
     expect(s.content).toContain("partial answer");
-    expect(s.content).toContain("Cursor sent nothing");
+    expect(s.content).toContain("Cursor made no progress");
     expect(s.finish).toBe("stop");
+    expect(fb.state.killed).toBe(true);
+  });
+
+  test("heartbeats alone do not keep a stuck run alive", async () => {
+    __test.limits.stallMs = 80;
+    const fb = fakeBridge();
+    const run = makeRun(fb.bridge);
+    const resp = __test.respond(run, true, () => __test.listen(run, NO_PEEK)) as Response;
+    fb.feed(frame(textDelta("waiting on an exec")));
+    const beats = setInterval(() => fb.feed(frame(heartbeat())), 20);
+    const s = await readSse(resp);
+    clearInterval(beats);
+    expect(s.content).toContain("Cursor made no progress");
     expect(fb.state.killed).toBe(true);
   });
 

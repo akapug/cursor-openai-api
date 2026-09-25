@@ -10,6 +10,7 @@ import {
   TextDeltaUpdateSchema,
   ThinkingDeltaUpdateSchema,
   TokenDeltaUpdateSchema,
+  HeartbeatUpdateSchema,
   ConversationStateStructureSchema,
   ConversationTokenDetailsSchema,
   type AgentServerMessage,
@@ -53,6 +54,17 @@ export function textDelta(text: string, thinking = false): AgentServerMessage {
         message: thinking
           ? { case: "thinkingDelta", value: create(ThinkingDeltaUpdateSchema, { text }) }
           : { case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) },
+      }),
+    },
+  });
+}
+
+export function heartbeat(): AgentServerMessage {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
       }),
     },
   });
