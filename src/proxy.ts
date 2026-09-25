@@ -391,6 +391,11 @@ export async function startProxy(
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
+    // helm patch (2026-09-25): LOOPBACK ONLY. The server takes no credential
+    // from its callers and spends the owner's Cursor account on every request;
+    // bound to 0.0.0.0 (MEASURED: `*:18315` in ss), anyone who could reach the
+    // machine could spend it. The only caller is the seat's local proxy.
+    hostname: "127.0.0.1",
     port,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
