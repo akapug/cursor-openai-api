@@ -16,6 +16,7 @@
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { getCursorModels } from "./models";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
+import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -567,6 +568,9 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
 // --- MCP Tool Definitions ---
 
+/** The MCP provider every caller tool is registered under. */
+const MCP_PROVIDER = "opencode";
+
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   return tools.map((t) => {
@@ -579,7 +583,7 @@ function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
     return create(McpToolDefinitionSchema, {
       name: fn.name,
       description: fn.description || "",
-      providerIdentifier: "opencode",
+      providerIdentifier: MCP_PROVIDER,
       toolName: fn.name,
       inputSchema,
     });
@@ -940,6 +944,9 @@ function handleKvMessage(
   }
 }
 
+/** agent.v1.ExecServerMessage.mcp_state_exec_args / ExecClientMessage.mcp_state_exec_result. */
+const MCP_STATE_EXEC_FIELD = 36;
+
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
@@ -979,6 +986,40 @@ function handleExecMessage(
       toolName: mcpArgs.toolName || mcpArgs.name,
       decodedArgs: JSON.stringify(decoded),
     });
+    return;
+  }
+
+  // helm patch (2026-09-25): CURSOR ASKS FOR MCP STATE BEFORE IT RUNS AN MCP
+  // TOOL, AND THE VENDORED PROTO CANNOT READ THE QUESTION. MEASURED on
+  // grok-4.7-high: after toolCallStarted the server sends an exec on field 36
+  // (mcp_state_exec_args, provider "opencode"), which this proto decodes with
+  // no case at all. Nothing answered it, Cursor waited, and the h2 child's
+  // 120 s timer killed the stream: the client got the model's "I'll run that
+  // with the Bash tool" and then a clean stop with no tool call — a two-minute
+  // hang that ends in an empty turn. The field numbers come from Cursor's own
+  // CLI bundle (agent.v1.ExecClientMessage.mcp_state_exec_result = 36;
+  // McpStateExecResult.success = 1; McpStateSuccess.servers = 1;
+  // McpStateServer: server_name = 1, server_identifier = 2, tools = 5).
+  // Answer with our one server and its tools, written as an unknown field.
+  if (execCase === undefined && execMsg.$unknown?.some((u) => u.no === MCP_STATE_EXEC_FIELD)) {
+    const server = new BinaryWriter()
+      .tag(1, WireType.LengthDelimited).string(MCP_PROVIDER)
+      .tag(2, WireType.LengthDelimited).string(MCP_PROVIDER);
+    for (const tool of mcpTools) {
+      server.tag(5, WireType.LengthDelimited).bytes(toBinary(McpToolDefinitionSchema, tool));
+    }
+    const success = new BinaryWriter().tag(1, WireType.LengthDelimited).bytes(server.finish()).finish();
+    const result = new BinaryWriter().tag(1, WireType.LengthDelimited).bytes(success).finish();
+    const execClientMessage = create(ExecClientMessageSchema, { id: execMsg.id, execId: execMsg.execId });
+    execClientMessage.$unknown = [{
+      no: MCP_STATE_EXEC_FIELD,
+      wireType: WireType.LengthDelimited,
+      data: new BinaryWriter().bytes(result).finish(),
+    }];
+    const clientMessage = create(AgentClientMessageSchema, {
+      message: { case: "execClientMessage", value: execClientMessage },
+    });
+    sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
     return;
   }
 
@@ -1773,4 +1814,4 @@ async function collectFullResponse(
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { peekFirstFrame, connectRefusal };
+export const __test = { peekFirstFrame, connectRefusal, handleExecMessage };
