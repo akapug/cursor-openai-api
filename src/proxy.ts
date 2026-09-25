@@ -74,6 +74,74 @@ const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 
+// helm patch (2026-09-25): CURSOR_BRIDGE_TRACE=1 logs every server frame's
+// case to stderr, so a stall can be read off the log instead of guessed at.
+const TRACE = process.env.CURSOR_BRIDGE_TRACE === "1";
+function trace(...parts: unknown[]): void {
+  if (TRACE) console.error("[trace]", ...parts);
+}
+
+/**
+ * Render protobuf wire bytes whose schema we do not have: field numbers,
+ * nested messages where the bytes parse as one, short strings otherwise.
+ * Used when Cursor sends a message kind newer than the vendored proto, so the
+ * log names WHAT arrived rather than "undefined".
+ */
+function wireDump(bytes: Uint8Array, depth = 0): string {
+  const parts: string[] = [];
+  let i = 0;
+  const varint = (): number => {
+    let v = 0, shift = 0, b = 0;
+    do {
+      if (i >= bytes.length) throw new Error("truncated varint");
+      b = bytes[i++]!;
+      v += (b & 0x7f) * 2 ** shift;
+      shift += 7;
+    } while (b & 0x80);
+    return v;
+  };
+  try {
+    while (i < bytes.length) {
+      const tag = varint();
+      const no = Math.floor(tag / 8), wt = tag % 8;
+      if (no === 0) throw new Error("field 0");
+      if (wt === 0) parts.push(`${no}=${varint()}`);
+      else if (wt === 1) { i += 8; parts.push(`${no}:f64`); }
+      else if (wt === 5) { i += 4; parts.push(`${no}:f32`); }
+      else if (wt === 2) {
+        const len = varint();
+        if (i + len > bytes.length) throw new Error("truncated len");
+        const sub = bytes.subarray(i, i + len);
+        i += len;
+        const nested = depth < 4 && len > 0 ? wireDump(sub, depth + 1) : "";
+        const text = new TextDecoder("utf-8", { fatal: false }).decode(sub);
+        parts.push(nested && !nested.startsWith("!")
+          ? `${no}{${nested}}`
+          : `${no}"${text.slice(0, 80).replace(/\s+/g, " ")}"`);
+      } else throw new Error(`wire type ${wt}`);
+    }
+  } catch (err) {
+    return `!${err instanceof Error ? err.message : String(err)}`;
+  }
+  return parts.join(" ");
+}
+
+/**
+ * The unknown fields protobuf-es kept on a decoded message, rendered. Its
+ * `data` is everything AFTER the tag, so the tag is re-encoded in front and
+ * the field is read back as a one-field message.
+ */
+function unknownFields(msg: { $unknown?: { no: number; wireType: number; data: Uint8Array }[] }): string {
+  return (msg.$unknown ?? []).map((u) => {
+    const tag: number[] = [];
+    for (let t = u.no * 8 + u.wireType; ; t = Math.floor(t / 128)) {
+      if (t < 128) { tag.push(t); break; }
+      tag.push((t % 128) | 0x80);
+    }
+    return wireDump(Buffer.concat([Buffer.from(tag), u.data]));
+  }).join(" | ") || "none";
+}
+
 // --- Types ---
 
 interface OpenAIToolCall {
@@ -780,6 +848,13 @@ function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
 ): void {
   const msgCase = msg.message.case;
+  if (TRACE) {
+    const sub = msg.message.value as
+      | { message?: { case?: string }; query?: { case?: string }; $unknown?: never[] }
+      | undefined;
+    trace("frame", msgCase ?? `unknown(${unknownFields(msg)})`,
+      sub?.message?.case ?? sub?.query?.case ?? (sub ? `unknown(${unknownFields(sub)})` : ""));
+  }
 
   if (msgCase === "interactionUpdate") {
     handleInteractionUpdate(msg.message.value, onText);
@@ -1018,7 +1093,7 @@ function handleExecMessage(
   }
 
   // Unknown exec type — log and ignore
-  console.error(`[proxy] unhandled exec: ${execCase}`);
+  console.error(`[proxy] unhandled exec: ${execCase ?? `unknown(${unknownFields(execMsg)})`}`);
 }
 
 /** Send an exec client message back to Cursor. */
