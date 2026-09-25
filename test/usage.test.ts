@@ -45,6 +45,21 @@ describe("usage", () => {
     expect(s.usage).toEqual({ prompt_tokens: 7944, completion_tokens: 16, total_tokens: 7960, helm_estimated: false });
   });
 
+  test("a resumed turn with no checkpoint of its own never reports the previous response's context", async () => {
+    // MEASURED on the live seat: after a compaction the next responses
+    // reported 141,519 and then 149,317 twice, the last checkpoint of an
+    // earlier response, carried onto a response that received none.
+    const { fb, run, resp } = started();
+    fb.feed(frame(checkpoint(141519)), frame(tokenDelta(203)), frame(mcpCall(1, "call-1", "echo 1")));
+    expect((await readSse(resp)).usage?.prompt_tokens).toBe(141519);
+    const resumed = __test.resumeRun(run, [{ toolCallId: "call-1", content: "one" }], "", true) as Response;
+    fb.feed(frame(textDelta("done")), frame(tokenDelta(4)));
+    fb.close(0);
+    const s = await readSse(resumed);
+    expect(s.usage).toEqual({ prompt_tokens: Math.ceil((400 + "one".length) / 4), completion_tokens: 4,
+      total_tokens: Math.ceil((400 + "one".length) / 4) + 4, helm_estimated: true });
+  });
+
   test("with no counts from Cursor the estimate is used and says so", async () => {
     const { fb, resp } = started();
     fb.feed(frame(textDelta("12345678")));

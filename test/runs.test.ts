@@ -118,6 +118,29 @@ describe("paused runs", () => {
     expect(a.fb.state.killed).toBe(true);
   });
 
+  test("a compacted conversation never resumes the run that holds the uncompacted one", async () => {
+    // MEASURED on the live seat: Claude Code's autocompact keeps the last
+    // tool call and its result after the summary, so the request after a
+    // compaction answers the paused run's tool call. Resuming it kept Cursor
+    // on the whole pre-compaction conversation: the compaction bought
+    // nothing, every turn still billed ~145k input, and the seat compacted
+    // three times in eight minutes.
+    const a = started(1);
+    const opened = [OPENING, { role: "user" as const, content: "do the task" }];
+    __test.stampConversation(a.run, opened);
+    a.fb.feed(frame(mcpCall(1, "call-A", "echo A")));
+    const id = (await readSse(a.resp)).toolCalls[0]!.id;
+    const [, call, result] = asked(id);
+    const continued = [...opened, call!, result!];
+    expect(__test.takePausedRun(continued)).toBe(a.run);
+    __test.pausedRuns.set(id, a.run);
+    const compacted = [{ role: "user" as const, content: "This session is being continued from a previous conversation. Summary: ..." }, call!, result!];
+    expect(__test.takePausedRun(compacted)).toBeNull();
+    expect(a.fb.state.killed).toBe(true);
+    expect(a.fb.writes.length).toBe(0);
+    expect(__test.findPausedRun(continued)).toBeNull();
+  });
+
   test("a paused run arms its expiry, and resuming disarms it", async () => {
     const a = started(1);
     a.fb.feed(frame(mcpCall(1, "call-1", "echo 1")));
