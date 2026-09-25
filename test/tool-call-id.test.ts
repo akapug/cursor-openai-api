@@ -7,24 +7,11 @@ import { describe, expect, test } from "bun:test";
 import { fromBinary } from "@bufbuild/protobuf";
 import { AgentClientMessageSchema, type McpResult } from "../src/proto/agent_pb";
 import { __test } from "../src/proxy";
+import { fakeBridge, makeRun } from "./helpers";
 
 const RAW = "call-a1bf6871-8e90-4716-bc98-046e2fedaac5-1\nfc_92ed79e9-7606-9371-8a79-e7b663e8db4c_0";
 // what CLIProxyAPI's SanitizeClaudeToolID makes of RAW
 const PROXY_REWRITE = RAW.replace(/[^a-zA-Z0-9_-]/g, "_");
-
-function fakeBridge() {
-  const writes: Uint8Array[] = [];
-  return {
-    writes,
-    bridge: {
-      proc: null as unknown as never,
-      write: (d: Uint8Array) => { writes.push(d); },
-      end: () => {},
-      onData: () => {},
-      onClose: () => {},
-    },
-  };
-}
 
 function mcpResultsOf(writes: Uint8Array[]): McpResult[] {
   return writes.map((w) => {
@@ -36,23 +23,18 @@ function mcpResultsOf(writes: Uint8Array[]): McpResult[] {
 }
 
 function resumeWith(toolCallIdSentBack: string) {
-  const { bridge, writes } = fakeBridge();
-  const exec = {
+  const fb = fakeBridge();
+  const run = makeRun(fb.bridge) as { awaiting: unknown[] };
+  run.awaiting.push({
     execId: "e1",
     execMsgId: 3,
     toolCallId: __test.clientToolCallId(RAW),
     cursorToolCallId: RAW,
     toolName: "Bash",
     decodedArgs: "{}",
-  };
-  const timer = setInterval(() => {}, 60_000);
-  clearInterval(timer);
-  __test.handleToolResultResume(
-    { bridge, heartbeatTimer: timer, blobStore: new Map(), mcpTools: [], pendingExecs: [exec], promptChars: 0, onResume: null } as never,
-    [{ toolCallId: toolCallIdSentBack, content: "MARKER-42\n" }],
-    "grok-4.7-high", [], "token", "key",
-  );
-  return mcpResultsOf(writes);
+  });
+  __test.resumeRun(run as never, [{ toolCallId: toolCallIdSentBack, content: "MARKER-42\n" }], "", true);
+  return mcpResultsOf(fb.writes);
 }
 
 describe("tool-call ids", () => {

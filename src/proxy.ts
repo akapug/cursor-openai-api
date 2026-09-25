@@ -206,13 +206,32 @@ interface PendingExec {
   decodedArgs: string;
 }
 
-/** A bridge kept alive across requests for tool result continuation. */
-interface ActiveBridge {
-  bridge: ReturnType<typeof spawnBridge>;
+/** The h2 child that carries one live Cursor stream. */
+type Bridge = ReturnType<typeof spawnBridge>;
+
+/**
+ * One live Cursor agent run, kept across the client's tool round trips.
+ *
+ * helm patch (2026-09-25): A RUN IS FOUND BY THE TOOL-CALL IDS IT HANDED OUT,
+ * NEVER BY WHAT THE CONVERSATION LOOKS LIKE. The old key was a hash of the
+ * model and the first 200 characters of the first user message. Claude Code
+ * opens every conversation — the seat's own and each subagent's — with the
+ * same <system-reminder> preamble, so a seat and all of its subagents shared
+ * ONE key. A subagent's tool call overwrote the seat's paused bridge in the
+ * map (the seat's bridge leaked, heartbeating on); the seat's tool result was
+ * then fed to the SUBAGENT's run and its answer streamed to the wrong
+ * conversation; and any fresh request under the same key ended whichever run
+ * was paused there. A tool-call id is unique per call and comes back verbatim
+ * with its result, so it is the real identity of "the run this result is for".
+ */
+interface Run {
+  /** Serial for log lines. */
+  id: number;
+  modelId: string;
+  bridge: Bridge;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
-  pendingExecs: PendingExec[];
   /**
    * helm patch (2026-09-16, ds4pro review F4): the conversation's prompt size,
    * carried across the tool round-trip. The resume path counted only the tool
@@ -220,14 +239,33 @@ interface ActiveBridge {
    * call and autocompact went quiet precisely when the window was fullest.
    */
   promptChars: number;
-  /** Resolve function to resume streaming after tool results are sent. */
-  onResume: ((sendFrame: (data: Uint8Array) => void) => void) | null;
+  /** Tool calls handed to the client whose results have not come back. */
+  awaiting: PendingExec[];
+  /** Tool calls Cursor asked for while no client request was attached. */
+  queued: PendingExec[];
+  /** Text/reasoning that arrived while no client request was attached. */
+  held: Array<{ text: string; thinking: boolean }>;
+  /** The client response currently attached, if any. */
+  sink: Sink | null;
+  /** Set by an exec mid-chunk; the pause happens once the chunk is read. */
+  pauseAfterChunk: boolean;
+  /** Undecoded bytes carried to the next chunk. */
+  pending: Buffer;
+  closed: boolean;
+  /** Ends a paused run nobody came back for. */
+  expiry: NodeJS.Timeout | null;
 }
 
-// Active bridges keyed by a session token (derived from conversation state).
-// When tool_calls are returned, the bridge stays alive. The next request
-// with tool results looks up the bridge and sends mcpResult messages.
-const activeBridges = new Map<string, ActiveBridge>();
+/** Paused runs by the client-facing id of every tool call they await. */
+const pausedRuns = new Map<string, Run>();
+let runSerial = 0;
+
+/**
+ * A paused run nobody resumes (the client was interrupted, crashed, or went
+ * another way) is ended after this long. Claude Code's own Bash tool caps a
+ * command at 10 minutes, so a live tool loop always comes back before it.
+ */
+const PAUSED_RUN_TTL_MS = 15 * 60_000;
 
 // --- H2 Bridge IPC ---
 
@@ -388,12 +426,8 @@ export function stopProxy(): void {
     proxyServer = undefined;
     proxyPort = undefined;
   }
-  // Clean up any lingering bridges
-  for (const [key, active] of activeBridges) {
-    clearInterval(active.heartbeatTimer);
-    active.bridge.end();
-    activeBridges.delete(key);
-  }
+  // Clean up any lingering paused runs
+  for (const run of new Set(pausedRuns.values())) endRun(run, "proxy stopping");
 }
 
 // --- Chat Completion Handler ---
@@ -418,28 +452,19 @@ async function handleChatCompletion(
     );
   }
 
-  // Check for an active bridge waiting for tool results
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const activeBridge = activeBridges.get(bridgeKey);
-
-  if (activeBridge && toolResults.length > 0) {
-    // Resume an existing bridge with tool results
-    activeBridges.delete(bridgeKey);
-    return handleToolResultResume(activeBridge, toolResults, modelId, tools, accessToken, bridgeKey);
-  }
-
-  // Clean up stale bridge if present
-  if (activeBridge) {
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+  // A request whose trailing tool results answer a paused run resumes it.
+  const paused = findPausedRun(body.messages);
+  if (paused) {
+    const resumed = resumeRun(paused, toolResults, userText, body.stream !== false);
+    if (resumed) return resumed;
+    console.error(`[bridge] run ${paused.id} ended before its tool results came back; answering statelessly`);
   }
 
   // helm patch (2026-09-16): TOOL RESULTS WERE SILENTLY DROPPED ON THE
   // STATELESS PATH. Reaching here with toolResults means we hold no live
   // bridge for them — the previous turn's stream already ended, the process
   // restarted, or the key did not match. parseMessages routes tool output into
-  // `toolResults`, which only handleToolResultResume above consumes, so the
+  // `toolResults`, which only the paused-run resume above consumes, so the
   // fresh request we build below carried NEITHER the results NOR any mention
   // of them. The model saw its own tool call with no output and concluded the
   // tool was broken. MEASURED: it answered "The Bash MCP tool failed; running
@@ -465,10 +490,7 @@ async function handleChatCompletion(
   const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
   payload.mcpTools = mcpTools;
 
-  if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId);
-  }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey);
+  return startRun(payload, accessToken, modelId, body.stream !== false);
 }
 
 // --- Message Parsing ---
@@ -837,20 +859,11 @@ function makeHeartbeatBytes(): Uint8Array {
 
 // --- Server Message Processing ---
 
-interface StreamState {
-  thinkingActive: boolean;
-  toolCallIndex: number;
-  pendingExecs: PendingExec[];
-  /** helm patch (2026-09-16): chars emitted upstream->client, for the usage estimate. */
-  outChars: number;
-}
-
 function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
   sendFrame: (data: Uint8Array) => void,
-  state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
 ): void {
@@ -1179,30 +1192,32 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-// --- Bridge Key ---
+// --- Runs: one Cursor stream, across the client's tool round trips ---
 
-/** Derive a stable key to associate a bridge with a conversation. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
-  // Use a hash of the first user message + model as a stable key.
-  // This is imperfect but sufficient for single-session use.
-  const firstUser = contentToText(messages.find((m) => m.role === "user")?.content);
-  return createHash("sha256")
-    .update(`${modelId}:${firstUser.slice(0, 200)}`)
-    .digest("hex")
-    .slice(0, 16);
+interface Usage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  helm_estimated: boolean;
 }
 
-// --- Streaming Handler ---
+/** Where a run's output goes while a client request is attached to it. */
+interface Sink {
+  text(text: string, thinking: boolean): void;
+  toolCall(exec: PendingExec): void;
+  /** Ends the client response; `usage` rides the terminal chunk when given. */
+  finish(reason: "stop" | "tool_calls", usage: Usage | null): void;
+  /** Characters written to this response, for the usage estimate. */
+  outChars: number;
+}
 
-async function handleStreamingResponse(
+/** Start a fresh Cursor run for this request and answer from it. */
+async function startRun(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
-  bridgeKey: string,
+  stream: boolean,
 ): Promise<Response> {
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-
   const bridge = spawnBridge(accessToken);
   bridge.write(frameConnectMessage(payload.requestBytes));
   const heartbeatTimer = setInterval(() => {
@@ -1224,239 +1239,178 @@ async function handleStreamingResponse(
       { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "60" } },
     );
   }
-
-  const stream = new ReadableStream({
-    start(controller) {
-      const encoder = new TextEncoder();
-      // helm patch (2026-09-16): A CLIENT DISCONNECT USED TO KILL THE WHOLE
-      // BRIDGE PROCESS. The `closed` flag only tracks OUR OWN closes, so when
-      // the client hangs up mid-stream — pressing Esc in Claude Code is enough —
-      // the runtime closes the controller underneath us, `closed` is still
-      // false, and the next enqueue throws ERR_INVALID_STATE from inside a
-      // bridge.onClose callback. Nothing catches it there, so bun exits and
-      // EVERY seat on this bridge starts getting ECONNREFUSED. MEASURED: the
-      // owner interrupted one turn and the bridge died with
-      // "Invalid state: Controller is already closed" at the stop chunk.
-      // A dead stream is a normal end of life, never a fatal error.
-      let closed = false;
-      const safeEnqueue = (text: string) => {
-        if (closed) return;
-        try {
-          controller.enqueue(encoder.encode(text));
-        } catch (err) {
-          // helm patch (2026-09-16, ds4pro review F5): do NOT swallow silently.
-          // A closed controller is the ordinary end of a stream; anything else
-          // is a real defect and used to be indistinguishable from it.
-          const msg = err instanceof Error ? err.message : String(err);
-          if (!/closed|ERR_INVALID_STATE/i.test(msg)) {
-            console.error("[bridge] SSE enqueue failed, not a disconnect:", msg);
-          }
-          closed = true; // stop writing either way; never throw from a callback
-        }
-      };
-      const sendSSE = (data: object) => {
-        safeEnqueue(`data: ${JSON.stringify(data)}\n\n`);
-      };
-      const sendDone = () => {
-        safeEnqueue("data: [DONE]\n\n");
-      };
-      const closeController = () => {
-        if (closed) return;
-        closed = true;
-        try {
-          controller.close();
-        } catch { /* already closed by the runtime — not an error */ }
-      };
-
-      const makeChunk = (
-        delta: Record<string, unknown>,
-        finishReason: string | null = null,
-      ) => ({
-        id: completionId,
-        object: "chat.completion.chunk",
-        created,
-        model: modelId,
-        choices: [{ index: 0, delta, finish_reason: finishReason }],
-      });
-
-      const state: StreamState = {
-        thinkingActive: false,
-        toolCallIndex: 0,
-        pendingExecs: [],
-        outChars: 0,
-      };
-
-      let mcpExecReceived = false;
-
-      // helm patch (2026-09-16): the bridge was spawned and its first frame
-      // peeked before this Response existed (see peekFirstFrame); take over
-      // the bytes it already holds, in order, before any new chunk lands.
-      let pendingBuffer = peeked.buf;
-
-      const processChunk = (incoming: Buffer) => {
-        pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
-
-        while (pendingBuffer.length >= 5) {
-          const flags = pendingBuffer[0]!;
-          const msgLen = pendingBuffer.readUInt32BE(1);
-          if (pendingBuffer.length < 5 + msgLen) break;
-
-          const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-          pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-
-          if (flags & CONNECT_END_STREAM_FLAG) {
-            const endError = parseConnectEndStream(messageBytes);
-            if (endError) {
-              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
-            }
-            continue;
-          }
-
-          try {
-            const serverMessage = fromBinary(
-              AgentServerMessageSchema,
-              messageBytes,
-            );
-            processServerMessage(
-              serverMessage,
-              payload.blobStore,
-              payload.mcpTools,
-              (data) => bridge.write(data),
-              state,
-              // onText
-              (text, isThinking) => {
-                // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD,
-                // NOT FENCED TEXT. This used to emit literal "<think>" / "</think>"
-                // into `content`, so the reasoning arrived as ordinary assistant
-                // TEXT. Claude Code's TUI strips those spans, so every reasoning
-                // token rendered as a BLANK LINE while still being generated and
-                // billed — and a reasoning-only turn rendered as a completely
-                // empty response. Owner saw it live: "it looks like it's dropping
-                // tokens". `reasoning_content` on the delta is the OpenAI
-                // convention CLIProxyAPI already maps to an Anthropic thinking
-                // block (internal/translator/openai/claude/openai_claude_response.go:169),
-                // which is exactly how the ds4pro family renders correctly.
-                state.outChars += text.length;
-                if (isThinking) {
-                  const first = !state.thinkingActive;
-                  state.thinkingActive = true;
-                  sendSSE(makeChunk(
-                    first
-                      ? { role: "assistant", reasoning_content: text }
-                      : { reasoning_content: text },
-                  ));
-                } else {
-                  state.thinkingActive = false;
-                  sendSSE(makeChunk({ content: text }));
-                }
-              },
-              // onMcpExec — the model wants to execute a tool.
-              (exec) => {
-                state.pendingExecs.push(exec);
-                mcpExecReceived = true;
-
-                // Close thinking if active
-                // helm patch (2026-09-16): no fence to close — reasoning now
-                // rides `reasoning_content`, so ending it is just a flag clear.
-                state.thinkingActive = false;
-
-                // Emit tool_calls with decoded arguments
-                const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }],
-                }));
-
-                // Keep the bridge alive for tool result continuation.
-                activeBridges.set(bridgeKey, {
-                  bridge,
-                  heartbeatTimer,
-                  blobStore: payload.blobStore,
-                  mcpTools: payload.mcpTools,
-                  pendingExecs: state.pendingExecs,
-                  promptChars: payload.promptChars,
-                  onResume: null,
-                });
-
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
-              },
-            );
-          } catch {
-            // Skip unparseable messages
-          }
-        }
-      };
-
-      bridge.onData(processChunk);
-
-      const onBridgeClose = () => {
-        clearInterval(heartbeatTimer);
-        if (!mcpExecReceived) {
-          // Normal completion — no pending tool calls
-          // helm patch (2026-09-16): reasoning rides `reasoning_content`; no fence to close.
-          // helm patch (2026-09-16): Cursor returns no token counts, so without
-          // this the client gets usage {0,0} forever and autocompact never fires.
-          // ~4 chars per token is the standard rough heuristic; it guards a
-          // context window, it is not billing.
-          const stopChunk = makeChunk({}, "stop") as Record<string, unknown>;
-          stopChunk.usage = {
-            prompt_tokens: Math.ceil(payload.promptChars / 4),
-            completion_tokens: Math.ceil(state.outChars / 4),
-            total_tokens: Math.ceil((payload.promptChars + state.outChars) / 4),
-            helm_estimated: true,
-          };
-          sendSSE(stopChunk);
-          sendDone();
-          closeController();
-        }
-        // If mcpExecReceived, we already closed the controller in onMcpExec
-      };
-      bridge.onClose(onBridgeClose);
-      if (pendingBuffer.length) processChunk(Buffer.alloc(0));
-      if (peeked.closedCode !== null) onBridgeClose();
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    },
-  });
+  const run: Run = {
+    id: ++runSerial,
+    modelId,
+    bridge,
+    heartbeatTimer,
+    blobStore: payload.blobStore,
+    mcpTools: payload.mcpTools,
+    promptChars: payload.promptChars,
+    awaiting: [],
+    queued: [],
+    held: [],
+    sink: null,
+    pauseAfterChunk: false,
+    pending: Buffer.alloc(0),
+    closed: false,
+    expiry: null,
+  };
+  trace(`run ${run.id} started (${modelId})`);
+  return respond(run, stream, () => listen(run, peeked));
 }
 
-// --- Tool Result Resume ---
+/** Take over the bridge from the first-frame peek: every byte it held, then the rest. */
+function listen(run: Run, peeked: FirstFramePeek): void {
+  run.bridge.onData((chunk) => feed(run, chunk));
+  run.bridge.onClose((code) => onRunClosed(run, code));
+  feed(run, peeked.buf);
+  if (peeked.closedCode !== null) onRunClosed(run, peeked.closedCode);
+}
 
-/** Resume a paused bridge by sending MCP results and continuing to stream. */
-function handleToolResultResume(
-  active: ActiveBridge,
+function feed(run: Run, chunk: Buffer): void {
+  run.pending = Buffer.concat([run.pending, chunk]);
+  while (run.pending.length >= 5) {
+    const flags = run.pending[0]!;
+    const msgLen = run.pending.readUInt32BE(1);
+    if (run.pending.length < 5 + msgLen) break;
+    const messageBytes = run.pending.subarray(5, 5 + msgLen);
+    run.pending = run.pending.subarray(5 + msgLen);
+
+    if (flags & CONNECT_END_STREAM_FLAG) {
+      const endError = parseConnectEndStream(messageBytes);
+      if (endError) {
+        console.error(`[bridge] run ${run.id}: ${endError.message}`);
+        emitText(run, `\n[Error: ${endError.message}]`, false);
+      }
+      continue;
+    }
+    try {
+      processServerMessage(
+        fromBinary(AgentServerMessageSchema, messageBytes),
+        run.blobStore,
+        run.mcpTools,
+        (data) => run.bridge.write(data),
+        (text, isThinking) => emitText(run, text, Boolean(isThinking)),
+        (exec) => onExec(run, exec),
+      );
+    } catch (err) {
+      // One bad frame must not end the read loop — that loop is the only
+      // thing that ever notices the run finishing.
+      console.error(`[bridge] run ${run.id}: frame of ${msgLen} bytes failed:`,
+        err instanceof Error ? err.message : String(err));
+    }
+  }
+  // Execs that arrive in one chunk are one batch: pause once, after all of
+  // them are on the wire, so parallel tool calls reach the client together.
+  if (run.pauseAfterChunk) pause(run);
+}
+
+function emitText(run: Run, text: string, thinking: boolean): void {
+  if (run.sink) run.sink.text(text, thinking);
+  else run.held.push({ text, thinking });
+}
+
+function onExec(run: Run, exec: PendingExec): void {
+  trace(`run ${run.id} tool call ${exec.toolName} id=${exec.toolCallId}`);
+  if (!run.sink) {
+    run.queued.push(exec);
+    return;
+  }
+  run.awaiting.push(exec);
+  run.sink.toolCall(exec);
+  run.pauseAfterChunk = true;
+}
+
+/** End the attached response with tool_calls and wait for the results. */
+function pause(run: Run): void {
+  run.pauseAfterChunk = false;
+  const sink = run.sink;
+  run.sink = null;
+  sink?.finish("tool_calls", null);
+  if (run.closed) return;
+  for (const exec of run.awaiting) pausedRuns.set(exec.toolCallId, run);
+  run.expiry = setTimeout(() => endRun(run, "no tool results came back"), PAUSED_RUN_TTL_MS);
+  trace(`run ${run.id} paused awaiting ${run.awaiting.map((e) => e.toolCallId).join(",")}`);
+}
+
+function onRunClosed(run: Run, code: number): void {
+  if (run.closed) return;
+  run.closed = true;
+  clearInterval(run.heartbeatTimer);
+  forget(run);
+  trace(`run ${run.id} closed (code ${code})`);
+  if (run.pauseAfterChunk) {
+    pause(run);
+    return;
+  }
+  const sink = run.sink;
+  run.sink = null;
+  sink?.finish("stop", estimateUsage(run, sink));
+}
+
+/** Drop a run from the paused map and disarm its expiry. */
+function forget(run: Run): void {
+  for (const exec of run.awaiting) {
+    if (pausedRuns.get(exec.toolCallId) === run) pausedRuns.delete(exec.toolCallId);
+  }
+  if (run.expiry) clearTimeout(run.expiry);
+  run.expiry = null;
+}
+
+/** Stop a run nobody will come back for. */
+function endRun(run: Run, why: string): void {
+  forget(run);
+  if (run.closed) return;
+  console.error(`[bridge] run ${run.id} ended: ${why}`);
+  clearInterval(run.heartbeatTimer);
+  run.bridge.end();
+  run.bridge.proc.kill();
+}
+
+/**
+ * The paused run a request answers: one whose tool call is answered by a tool
+ * message after the request's last assistant message.
+ */
+function findPausedRun(messages: OpenAIMessage[]): Run | null {
+  for (let i = messages.length - 1; i >= 0 && messages[i]!.role !== "assistant"; i--) {
+    const m = messages[i]!;
+    if (m.role !== "tool") continue;
+    const run = pausedRuns.get(clientToolCallId(m.tool_call_id ?? ""));
+    if (run) return run;
+  }
+  return null;
+}
+
+/**
+ * Feed the client's tool results to a paused run and answer from it, or
+ * return null when the run has ended and the request must go stateless.
+ */
+function resumeRun(
+  run: Run,
   toolResults: ToolResultInfo[],
-  modelId: string,
-  tools: OpenAIToolDef[],
-  accessToken: string,
-  bridgeKey: string,
-): Response {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
-  const carriedPromptChars = active.promptChars;
-  // helm patch (2026-09-16): inbound size for the usage estimate on this path.
-  const resumePromptChars = toolResults.reduce(
-    (n, r) => n + (typeof r.content === "string" ? r.content.length : 0), 0);
-
-  // Send mcpResult for each pending exec that has a matching tool result
-  for (const exec of pendingExecs) {
-    const result = toolResults.find(
-      (r) => clientToolCallId(r.toolCallId) === exec.toolCallId,
-    );
+  userText: string,
+  stream: boolean,
+): Response | Promise<Response> | null {
+  forget(run);
+  if (run.closed) return null;
+  const answered = run.awaiting.map((exec) => toolResults.find(
+    (r) => clientToolCallId(r.toolCallId) === exec.toolCallId,
+  ));
+  // Text the client sent alongside its tool results (Claude Code appends
+  // reminders, and a user who interrupts types here) has nowhere else to go
+  // on a paused run: it rides the last result instead of vanishing.
+  let last = answered.length - 1;
+  while (last >= 0 && !answered[last]) last--;
+  if (userText && last >= 0) {
+    answered[last] = { ...answered[last]!, content: `${answered[last]!.content}\n\n<user_message>\n${userText}\n</user_message>` };
+  } else if (userText) {
+    console.error(`[bridge] run ${run.id}: user text with no matching tool result was dropped`);
+  }
+  for (const [i, exec] of run.awaiting.entries()) {
+    const result = answered[i];
+    if (result) run.promptChars += result.content.length;
+    else console.error(`[bridge] run ${run.id}: no result for tool call ${exec.toolCallId}`);
     const mcpResult = result
       ? create(McpResultSchema, {
           result: {
@@ -1480,29 +1434,70 @@ function handleToolResultResume(
             value: create(McpErrorSchema, { error: "Tool result not provided" }),
           },
         });
-
     const execClientMessage = create(ExecClientMessageSchema, {
       id: exec.execMsgId,
       execId: exec.execId,
-      message: {
-        case: "mcpResult" as any,
-        value: mcpResult as any,
-      },
+      message: { case: "mcpResult", value: mcpResult },
     });
-
     const clientMessage = create(AgentClientMessageSchema, {
       message: { case: "execClientMessage", value: execClientMessage },
     });
-
-    bridge.write(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
-    );
+    run.bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
   }
+  run.awaiting = [];
+  trace(`run ${run.id} resumed`);
+  return respond(run, stream, () => {});
+}
 
-  // Now stream the continuation response.
-  // Reuse the same bridgeKey so subsequent tool calls can be found by deriveBridgeKey().
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
+/**
+ * Attach a new client response to a run: replay what arrived while no one
+ * was listening, hand out tool calls Cursor asked for meanwhile, and finish
+ * at once if the run already ended.
+ */
+function attach(run: Run, sink: Sink): void {
+  run.sink = sink;
+  for (const h of run.held.splice(0)) sink.text(h.text, h.thinking);
+  const queued = run.queued.splice(0);
+  for (const exec of queued) {
+    run.awaiting.push(exec);
+    sink.toolCall(exec);
+  }
+  if (queued.length) pause(run);
+  else if (run.closed) {
+    run.sink = null;
+    sink.finish("stop", estimateUsage(run, sink));
+  }
+}
+
+/**
+ * helm patch (2026-09-16): Cursor returns no token counts, so without this the
+ * client gets usage {0,0} forever and autocompact never fires. ~4 chars per
+ * token is the standard rough heuristic; it guards a context window, it is
+ * not billing.
+ */
+function estimateUsage(run: Run, sink: Sink): Usage {
+  return {
+    prompt_tokens: Math.ceil(run.promptChars / 4),
+    completion_tokens: Math.ceil(sink.outChars / 4),
+    total_tokens: Math.ceil((run.promptChars + sink.outChars) / 4),
+    helm_estimated: true,
+  };
+}
+
+function respond(run: Run, stream: boolean, then: () => void): Response | Promise<Response> {
+  return stream ? sseResponse(run, then) : jsonResponse(run, then);
+}
+
+function completionIdentity() {
+  return {
+    id: `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`,
+    created: Math.floor(Date.now() / 1000),
+  };
+}
+
+function sseResponse(run: Run, then: () => void): Response {
+  const { id, created } = completionIdentity();
+  let mine: Sink | null = null;
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
@@ -1532,173 +1527,68 @@ function handleToolResultResume(
           closed = true; // stop writing either way; never throw from a callback
         }
       };
-      const sendSSE = (data: object) => {
-        safeEnqueue(`data: ${JSON.stringify(data)}\n\n`);
-      };
-      const sendDone = () => {
-        safeEnqueue("data: [DONE]\n\n");
-      };
-      const closeController = () => {
-        if (closed) return;
-        closed = true;
-        try {
-          controller.close();
-        } catch { /* already closed by the runtime — not an error */ }
-      };
-
-      const makeChunk = (
-        delta: Record<string, unknown>,
-        finishReason: string | null = null,
-      ) => ({
-        id: completionId,
+      const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) => ({
+        id,
         object: "chat.completion.chunk",
         created,
-        model: modelId,
+        model: run.modelId,
         choices: [{ index: 0, delta, finish_reason: finishReason }],
       });
-
-      const state: StreamState = {
-        thinkingActive: false,
-        toolCallIndex: 0,
-        pendingExecs: [],
+      const send = (data: object) => safeEnqueue(`data: ${JSON.stringify(data)}\n\n`);
+      let thinking = false;
+      let toolIndex = 0;
+      const sink: Sink = {
         outChars: 0,
-      };
-
-      let mcpExecReceived = false;
-
-      let pendingBuffer = Buffer.alloc(0);
-
-      const processChunk = (incoming: Buffer) => {
-        pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
-
-        while (pendingBuffer.length >= 5) {
-          const flags = pendingBuffer[0]!;
-          const msgLen = pendingBuffer.readUInt32BE(1);
-          if (pendingBuffer.length < 5 + msgLen) break;
-
-          const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-          pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-
-          if (flags & CONNECT_END_STREAM_FLAG) {
-            const endError = parseConnectEndStream(messageBytes);
-            if (endError) {
-              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
-            }
-            continue;
+        text(text, isThinking) {
+          sink.outChars += text.length;
+          // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD, NOT
+          // FENCED TEXT. `reasoning_content` on the delta is the OpenAI
+          // convention CLIProxyAPI maps to an Anthropic thinking block
+          // (internal/translator/openai/claude/openai_claude_response.go);
+          // literal <think> spans in `content` rendered as blank lines.
+          if (isThinking) {
+            send(chunk(thinking ? { reasoning_content: text } : { role: "assistant", reasoning_content: text }));
+          } else {
+            send(chunk({ content: text }));
           }
-
+          thinking = isThinking;
+        },
+        toolCall(exec) {
+          thinking = false;
+          send(chunk({
+            tool_calls: [{
+              index: toolIndex++,
+              id: exec.toolCallId,
+              type: "function",
+              function: { name: exec.toolName, arguments: exec.decodedArgs },
+            }],
+          }));
+        },
+        finish(reason, usage) {
+          const last = chunk({}, reason) as Record<string, unknown>;
+          if (usage) last.usage = usage;
+          send(last);
+          safeEnqueue("data: [DONE]\n\n");
+          if (closed) return;
+          closed = true;
           try {
-            const serverMessage = fromBinary(
-              AgentServerMessageSchema,
-              messageBytes,
-            );
-            processServerMessage(
-              serverMessage,
-              blobStore,
-              mcpTools,
-              (data) => bridge.write(data),
-              state,
-              (text, isThinking) => {
-                // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD,
-                // NOT FENCED TEXT. This used to emit literal "<think>" / "</think>"
-                // into `content`, so the reasoning arrived as ordinary assistant
-                // TEXT. Claude Code's TUI strips those spans, so every reasoning
-                // token rendered as a BLANK LINE while still being generated and
-                // billed — and a reasoning-only turn rendered as a completely
-                // empty response. Owner saw it live: "it looks like it's dropping
-                // tokens". `reasoning_content` on the delta is the OpenAI
-                // convention CLIProxyAPI already maps to an Anthropic thinking
-                // block (internal/translator/openai/claude/openai_claude_response.go:169),
-                // which is exactly how the ds4pro family renders correctly.
-                state.outChars += text.length;
-                if (isThinking) {
-                  const first = !state.thinkingActive;
-                  state.thinkingActive = true;
-                  sendSSE(makeChunk(
-                    first
-                      ? { role: "assistant", reasoning_content: text }
-                      : { reasoning_content: text },
-                  ));
-                } else {
-                  state.thinkingActive = false;
-                  sendSSE(makeChunk({ content: text }));
-                }
-              },
-              (exec) => {
-                state.pendingExecs.push(exec);
-                mcpExecReceived = true;
-
-                // helm patch (2026-09-16): no fence to close — reasoning now
-                // rides `reasoning_content`, so ending it is just a flag clear.
-                state.thinkingActive = false;
-
-                const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }],
-                }));
-
-                activeBridges.set(bridgeKey, {
-                  bridge,
-                  heartbeatTimer,
-                  blobStore,
-                  mcpTools,
-                  pendingExecs: state.pendingExecs,
-                  promptChars: carriedPromptChars,
-                  onResume: null,
-                });
-
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
-              },
-            );
-          } catch {
-            // Skip
-          }
-        }
+            controller.close();
+          } catch { /* already closed by the runtime — not an error */ }
+        },
       };
-
-      // Re-attach data handler to the existing bridge
-      bridge.onData(processChunk);
-
-      bridge.onClose(() => {
-        clearInterval(heartbeatTimer);
-        if (!mcpExecReceived) {
-          // helm patch (2026-09-16): reasoning rides `reasoning_content`; no fence to close.
-          // helm patch (2026-09-16): Cursor returns no token counts, so without
-          // this the client gets usage {0,0} forever and autocompact never fires.
-          // ~4 chars per token is the standard rough heuristic; it guards a
-          // context window, it is not billing.
-          const stopChunk = makeChunk({}, "stop") as Record<string, unknown>;
-          stopChunk.usage = {
-            // helm patch (2026-09-16): this resume path has no `payload` in
-            // scope — its inbound text is the tool results being fed back.
-            // helm patch (2026-09-16, ds4pro review F4): count the WHOLE
-            // conversation carried across the tool round-trip, not just the
-            // tool-result text. Counting only the results collapsed
-            // input_tokens after every tool call and silenced autocompact
-            // exactly when the context was fullest.
-            prompt_tokens: Math.ceil((carriedPromptChars + resumePromptChars) / 4),
-            completion_tokens: Math.ceil(state.outChars / 4),
-            total_tokens: Math.ceil((carriedPromptChars + resumePromptChars + state.outChars) / 4),
-            helm_estimated: true,
-          };
-          sendSSE(stopChunk);
-          sendDone();
-          closeController();
-        }
-      });
+      mine = sink;
+      attach(run, sink);
+      then();
+    },
+    cancel() {
+      // The client hung up while this response was the run's live one: no
+      // request can ever come back for it, so end it rather than let it run.
+      if (mine && run.sink === mine) {
+        run.sink = null;
+        endRun(run, "client disconnected");
+      }
     },
   });
-
   return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream",
@@ -1708,134 +1598,50 @@ function handleToolResultResume(
   });
 }
 
-// --- Non-Streaming Handler ---
-
-function handleNonStreamingResponse(
-  payload: CursorRequestPayload,
-  accessToken: string,
-  modelId: string,
-): Response {
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-
-  const responsePromise = collectFullResponse(payload, accessToken).then(
-    (fullText) =>
-      new Response(
+function jsonResponse(run: Run, then: () => void): Promise<Response> {
+  const { id, created } = completionIdentity();
+  const { promise, resolve } = Promise.withResolvers<Response>();
+  let content = "";
+  let reasoning = "";
+  const toolCalls: OpenAIToolCall[] = [];
+  const sink: Sink = {
+    outChars: 0,
+    // helm patch (2026-08-11): thinking and answer are two streams; keep them
+    // apart. Measured: splicing them gave "I am Cursor G 4.5.rok.I am ...".
+    text(text, isThinking) {
+      sink.outChars += text.length;
+      if (isThinking) reasoning += text;
+      else content += text;
+    },
+    toolCall(exec) {
+      toolCalls.push({
+        id: exec.toolCallId,
+        type: "function",
+        function: { name: exec.toolName, arguments: exec.decodedArgs },
+      });
+    },
+    finish(reason, usage) {
+      const message: Record<string, unknown> = { role: "assistant", content };
+      if (reasoning) message.reasoning_content = reasoning;
+      if (toolCalls.length) message.tool_calls = toolCalls;
+      resolve(new Response(
         JSON.stringify({
-          id: completionId,
+          id,
           object: "chat.completion",
           created,
-          model: modelId,
-          choices: [
-            {
-              index: 0,
-              message: { role: "assistant", content: fullText },
-              finish_reason: "stop",
-            },
-          ],
-          usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-          },
+          model: run.modelId,
+          choices: [{ index: 0, message, finish_reason: reason }],
+          ...(usage ? { usage } : {}),
         }),
         { headers: { "Content-Type": "application/json" } },
-      ),
-  );
-
-  return responsePromise as unknown as Response;
-}
-
-async function collectFullResponse(
-  payload: CursorRequestPayload,
-  accessToken: string,
-): Promise<string> {
-  const { promise, resolve } = Promise.withResolvers<string>();
-  // helm patch (2026-08-11): THINKING AND ANSWER ARE TWO STREAMS AND THIS
-  // PATH USED TO SPLICE THEM INTO ONE STRING. processServerMessage reports
-  // which stream a delta belongs to (onText's second argument), and the SSE
-  // path uses it to fence reasoning in <think>…</think>; this collector
-  // passed `(text) => { fullText += text; }` and dropped the flag, so
-  // interleaved thinking/answer deltas shredded into each other MID-WORD.
-  // Measured live against cursor-grok-4.5-high: a one-sentence request came
-  // back "I am Cursor G 4.5.rok.I am Cursor Grok 4.5 and I am reachable."
-  // Keep the two apart, and return the ANSWER — an OpenAI-compatible
-  // message.content is the reply, not the scratchpad.
-  let answerText = "";
-  let thinkingText = "";
-
-  const bridge = spawnBridge(accessToken);
-
-  bridge.write(frameConnectMessage(payload.requestBytes));
-
-  const heartbeatTimer = setInterval(() => {
-    bridge.write(makeHeartbeatBytes());
-  }, 5_000);
-
-  let pendingBuffer = Buffer.alloc(0);
-  const state: StreamState = {
-    thinkingActive: false,
-    toolCallIndex: 0,
-    pendingExecs: [],
-    outChars: 0,
+      ));
+    },
   };
-
-  bridge.onData((incoming) => {
-    pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
-
-    while (pendingBuffer.length >= 5) {
-      const flags = pendingBuffer[0]!;
-      const msgLen = pendingBuffer.readUInt32BE(1);
-      if (pendingBuffer.length < 5 + msgLen) break;
-
-      const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-      pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-
-      if (flags & CONNECT_END_STREAM_FLAG) continue;
-
-      try {
-        const serverMessage = fromBinary(
-          AgentServerMessageSchema,
-          messageBytes,
-        );
-        processServerMessage(
-          serverMessage,
-          payload.blobStore,
-          payload.mcpTools,
-          (data) => bridge.write(data),
-          state,
-          (text, isThinking) => {
-            if (isThinking) thinkingText += text;
-            else answerText += text;
-          },
-          () => {},
-        );
-      } catch {
-        // Skip
-      }
-    }
-  });
-
-  bridge.onClose(() => {
-    clearInterval(heartbeatTimer);
-    // A turn that produced ONLY reasoning must not resolve empty: an empty
-    // 200 is the silent-swallow shape the proxy's own patches exist to kill,
-    // and it is indistinguishable from a dropped upstream. Fence it so the
-    // caller can see what it is rather than receiving nothing.
-    if (!answerText && thinkingText) {
-      // helm patch (2026-09-16): this used to fence the text in <think>…</think>,
-      // which defeated its own purpose — Claude Code STRIPS those spans, so the
-      // anti-silent-swallow guard produced a response that rendered as EMPTY,
-      // the exact shape it exists to prevent. Say what happened in plain text.
-      resolve(`[reasoning-only turn: the model produced no answer, only the scratchpad below]\n\n${thinkingText}`);
-      return;
-    }
-    resolve(answerText);
-  });
-
+  attach(run, sink);
+  then();
   return promise;
 }
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, handleToolResultResume };
+export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, resumeRun, pausedRuns };
