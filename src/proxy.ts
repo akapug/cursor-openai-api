@@ -188,6 +188,22 @@ interface CursorRequestPayload {
    * guards a context window, it is not billing.
    */
   promptChars: number;
+  /** The client conversation this request carries (`conversationStamp`). */
+  conversation?: ConversationStamp;
+}
+
+/**
+ * helm patch: WHICH CLIENT CONVERSATION A RUN HOLDS. A paused run is found by
+ * the tool-call ids it handed out (findPausedRun), and that alone cannot tell
+ * a continuation from a REWRITE: Claude Code's autocompact keeps the last
+ * tool call and its result after the summary, so the request after a
+ * compaction answers the paused run's tool call while carrying a different,
+ * much shorter conversation. The stamp is the first user message's digest
+ * and the message count; a continuation keeps the head and grows.
+ */
+interface ConversationStamp {
+  head: string;
+  seen: number;
 }
 
 /** A pending tool execution waiting for results from the caller. */
@@ -253,8 +269,15 @@ interface Run {
   expiry: NodeJS.Timeout | null;
   /** Ends an attached run Cursor has gone silent on. */
   stall: NodeJS.Timeout | null;
-  /** The conversation's size in the model's window, as Cursor last reported it (0 = not yet). */
+  /**
+   * The conversation's size in the model's window, as Cursor reported it
+   * during the response now attached (0 = not yet). Reset when a paused run
+   * resumes: a checkpoint belongs to the response it arrived in, and a
+   * response that gets none reports the estimate, never an earlier figure.
+   */
   contextTokens: number;
+  /** The client conversation this run holds; absent = unknown, not vetoed. */
+  conversation?: ConversationStamp;
   /** Output tokens Cursor reported while no client was attached. */
   heldOutputTokens: number;
 }
@@ -485,8 +508,9 @@ async function handleChatCompletion(
     );
   }
 
-  // A request whose trailing tool results answer a paused run resumes it.
-  const paused = findPausedRun(body.messages);
+  // A request whose trailing tool results answer a paused run resumes it,
+  // unless the conversation was rewritten under it (takePausedRun).
+  const paused = takePausedRun(body.messages);
   if (paused) {
     const resumed = resumeRun(paused, toolResults, tailText, body.stream !== false);
     if (resumed) return resumed;
@@ -501,6 +525,7 @@ async function handleChatCompletion(
   const { history, userText } = toHistory(body.messages);
   const payload = buildCursorRequest(modelId, systemPrompt, history, userText);
   payload.mcpTools = buildMcpToolDefinitions(tools);
+  payload.conversation = conversationStamp(body.messages);
 
   return startRun(payload, accessToken, modelId, body.stream !== false);
 }
@@ -1304,6 +1329,7 @@ async function startRun(
     stall: null,
     contextTokens: 0,
     heldOutputTokens: 0,
+    conversation: payload.conversation,
   };
   trace(`run ${run.id} started (${modelId})`);
   return respond(run, stream, () => listen(run, peeked));
@@ -1445,6 +1471,42 @@ function endRun(run: Run, why: string): void {
   run.bridge.proc.kill();
 }
 
+/** The stamp of a client conversation (see ConversationStamp). */
+function conversationStamp(messages: OpenAIMessage[]): ConversationStamp {
+  const first = messages.find((m) => m.role === "user");
+  const head = createHash("sha256").update(contentToText(first?.content ?? "")).digest("hex");
+  return { head, seen: messages.length };
+}
+
+function stampConversation(run: Run, messages: OpenAIMessage[]): void {
+  run.conversation = conversationStamp(messages);
+}
+
+/** Does this request continue the conversation the run holds? */
+function continues(run: Run, messages: OpenAIMessage[]): boolean {
+  if (!run.conversation) return true;
+  const now = conversationStamp(messages);
+  return now.head === run.conversation.head && now.seen > run.conversation.seen;
+}
+
+/**
+ * The paused run this request may resume, or null. A run found by its tool
+ * ids whose conversation the request does not continue (a compaction
+ * rewrote it) is ENDED rather than resumed: resuming kept Cursor on the whole
+ * pre-compaction conversation, so the compaction bought nothing and every
+ * turn went on billing the old window. The request then goes stateless and
+ * Cursor gets the compacted history.
+ */
+function takePausedRun(messages: OpenAIMessage[]): Run | null {
+  const run = findPausedRun(messages);
+  if (!run || continues(run, messages)) {
+    if (run) stampConversation(run, messages);
+    return run;
+  }
+  endRun(run, "the client's conversation was rewritten (a compaction); its history goes to a new run");
+  return null;
+}
+
 /**
  * The paused run a request answers: one whose tool call is answered by a tool
  * message after the request's last assistant message.
@@ -1471,6 +1533,7 @@ function resumeRun(
 ): Response | Promise<Response> | null {
   forget(run);
   if (run.closed) return null;
+  run.contextTokens = 0;   // this response reports only its own checkpoints
   const answered = run.awaiting.map((exec) => toolResults.find(
     (r) => clientToolCallId(r.toolCallId) === exec.toolCallId,
   ));
@@ -1562,6 +1625,12 @@ function attach(run: Run, sink: Sink): void {
  * (task/2640). Every terminal chunk now carries usage; the chars/4 estimate
  * remains only for a side Cursor has not reported yet, and `helm_estimated`
  * says whether it was used.
+ *
+ * ONLY THIS RESPONSE'S COUNTS. A resumed run used to report its last
+ * checkpoint from an EARLIER response when the resumed one received none:
+ * measured on the live seat, 141,519 and then 149,317 twice after
+ * compactions, which kept Claude Code compacting. `contextTokens` is reset
+ * when a run resumes, so a response with no checkpoint reports the estimate.
  */
 function usageOf(run: Run, sink: Sink): Usage {
   const output = sink.outputTokens || Math.ceil(sink.outChars / 4);
@@ -1737,4 +1806,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
+export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
