@@ -24,10 +24,6 @@ import {
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
-  ConversationStepSchema,
-  AgentConversationTurnStructureSchema,
-  ConversationTurnStructureSchema,
-  AssistantMessageSchema,
   BackgroundShellSpawnResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
@@ -473,11 +469,11 @@ async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
 ): Promise<Response> {
-  let { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  const { systemPrompt, tailText, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
 
-  if (!userText && toolResults.length === 0) {
+  if (!body.messages.some((m) => m.role === "user" || m.role === "tool")) {
     return new Response(
       JSON.stringify({
         error: {
@@ -492,40 +488,19 @@ async function handleChatCompletion(
   // A request whose trailing tool results answer a paused run resumes it.
   const paused = findPausedRun(body.messages);
   if (paused) {
-    const resumed = resumeRun(paused, toolResults, userText, body.stream !== false);
+    const resumed = resumeRun(paused, toolResults, tailText, body.stream !== false);
     if (resumed) return resumed;
     console.error(`[bridge] run ${paused.id} ended before its tool results came back; answering statelessly`);
   }
 
   // helm patch (2026-09-16): TOOL RESULTS WERE SILENTLY DROPPED ON THE
-  // STATELESS PATH. Reaching here with toolResults means we hold no live
-  // bridge for them — the previous turn's stream already ended, the process
-  // restarted, or the key did not match. parseMessages routes tool output into
-  // `toolResults`, which only the paused-run resume above consumes, so the
-  // fresh request we build below carried NEITHER the results NOR any mention
-  // of them. The model saw its own tool call with no output and concluded the
-  // tool was broken. MEASURED: it answered "The Bash MCP tool failed; running
-  // the same command with Shell." That is the whole reason a real seat could
-  // chat but never complete a task, because Claude Code sends every turn
-  // statelessly with the results in the history.
-  //
-  // Fold them into the outgoing message as plain text, the same move the
-  // history fold in buildCursorRequest makes for prior turns. A tool-result-
-  // only turn has no user text at all, so this is also what keeps it non-empty.
-  if (toolResults.length > 0) {
-    const rendered = toolResults
-      .map((r) => `<tool_result id="${r.toolCallId}">\n${r.content}\n</tool_result>`)
-      .join("\n");
-    userText = userText
-      ? `${rendered}\n\n${userText}`
-      : `The tool calls you requested have run. Their output:\n\n${rendered}\n\n` +
-        `Continue from here using that output.`;
-    toolResults = [];
-  }
-
-  const mcpTools = buildMcpToolDefinitions(tools);
-  const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
-  payload.mcpTools = mcpTools;
+  // STATELESS PATH, so the model saw its own tool call with no output and
+  // concluded the tool was broken. Every request that reaches here carries
+  // its whole conversation — tool calls and results included — as structured
+  // history (toHistory), so nothing the client sent is dropped.
+  const { history, userText } = toHistory(body.messages);
+  const payload = buildCursorRequest(modelId, systemPrompt, history, userText);
+  payload.mcpTools = buildMcpToolDefinitions(tools);
 
   return startRun(payload, accessToken, modelId, body.stream !== false);
 }
@@ -539,8 +514,9 @@ interface ToolResultInfo {
 
 interface ParsedMessages {
   systemPrompt: string;
-  userText: string;
-  turns: Array<{ userText: string; assistantText: string }>;
+  /** User text after the last assistant message (rides a resumed run's results). */
+  tailText: string;
+  /** Every tool message in the request, for a paused run's pending calls. */
   toolResults: ToolResultInfo[];
 }
 
@@ -580,52 +556,112 @@ function contentToText(content: unknown): string {
 }
 
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
-  let systemPrompt = "You are a helpful assistant.";
-  const pairs: Array<{ userText: string; assistantText: string }> = [];
-  const toolResults: ToolResultInfo[] = [];
-
-  // Collect system messages
   const systemParts = messages
     .filter((m) => m.role === "system")
     .map((m) => contentToText(m.content));
-  if (systemParts.length > 0) {
-    systemPrompt = systemParts.join("\n");
+  const toolResults = messages
+    .filter((m) => m.role === "tool")
+    .map((m) => ({ toolCallId: m.tool_call_id ?? "", content: contentToText(m.content) }));
+  const tail: string[] = [];
+  for (let i = messages.length - 1; i >= 0 && messages[i]!.role !== "assistant"; i--) {
+    if (messages[i]!.role === "user") tail.unshift(contentToText(messages[i]!.content));
   }
+  return {
+    systemPrompt: systemParts.length > 0 ? systemParts.join("\n") : "You are a helpful assistant.",
+    tailText: tail.filter(Boolean).join("\n\n"),
+    toolResults,
+  };
+}
 
-  // Separate tool results from conversation turns
-  const nonSystem = messages.filter((m) => m.role !== "system");
-  let pendingUser = "";
+// --- History ---
 
-  for (const msg of nonSystem) {
-    if (msg.role === "tool") {
-      toolResults.push({
-        toolCallId: msg.tool_call_id ?? "",
-        content: contentToText(msg.content),
+/**
+ * One prior message, in the shape Cursor reads from a root-prompt blob: the
+ * AI SDK ModelMessage (role + typed parts), with tool calls and tool results
+ * as their own parts. Reference for the shapes: edgebyte-ai/cliproxyapi-
+ * cursor-provider-plugin (MIT), translate.go normalizeHistoryMessages.
+ */
+interface HistoryMessage {
+  role: "user" | "assistant" | "tool";
+  id?: string;
+  content: Array<Record<string, unknown>>;
+}
+
+/**
+ * The name Cursor gives a caller tool (McpArgs.name, MEASURED: "opencode-Bash"
+ * for our "Bash"). History records a past call under it, so the model reads
+ * its own past calls as calls to the MCP tool it should use again.
+ */
+function mcpToolName(name: string): string {
+  return `${MCP_PROVIDER}-${name}`;
+}
+
+/** What Cursor is asked when the request ends in tool results, not a user message. */
+const CONTINUE_PROMPT = "Continue from where you left off, using the tool results above.";
+
+function parseToolArgs(args: string): unknown {
+  try {
+    return JSON.parse(args || "{}");
+  } catch {
+    return { _raw: args };
+  }
+}
+
+/**
+ * helm patch (2026-09-25): HISTORY GOES TO CURSOR AS STRUCTURED MESSAGES.
+ * The 2026-09-16 workaround folded every prior turn into one plain-text
+ * transcript inside the new user message, because synthesised
+ * ConversationTurnStructure turns drew failed_precondition. That fold kept
+ * user and assistant TEXT only: every tool call vanished from the
+ * transcript, and every tool result in the whole conversation was pasted in
+ * a block at the top of the latest message, cut off from the call it
+ * answered (ds4pro review F2). A Claude Code seat's history is mostly tool
+ * calls, so each new user turn showed the model a garbled record of its own
+ * work. Each prior message is now its own root-prompt blob, with tool calls
+ * and tool results as typed parts in order; the latest user message is the
+ * action (or, when the request ends in tool results, a request to continue).
+ */
+function toHistory(messages: OpenAIMessage[]): { history: HistoryMessage[]; userText: string } {
+  const convo = messages.filter((m) => m.role !== "system");
+  const last = convo.at(-1);
+  const endsWithUser = last?.role === "user";
+  const userText = endsWithUser ? contentToText(last!.content) : "";
+  const toolNames = new Map<string, string>();
+  const history: HistoryMessage[] = [];
+  for (const m of endsWithUser ? convo.slice(0, -1) : convo) {
+    if (m.role === "user") {
+      const text = contentToText(m.content);
+      if (text) history.push({ role: "user", content: [{ type: "text", text }] });
+    } else if (m.role === "assistant") {
+      const parts: Array<Record<string, unknown>> = [];
+      const text = contentToText(m.content);
+      if (text) parts.push({ type: "text", text });
+      for (const call of m.tool_calls ?? []) {
+        const name = mcpToolName(call.function.name);
+        toolNames.set(call.id, name);
+        parts.push({
+          type: "tool-call",
+          toolCallId: call.id,
+          toolName: name,
+          args: parseToolArgs(call.function.arguments),
+        });
+      }
+      if (parts.length) history.push({ role: "assistant", content: parts });
+    } else if (m.role === "tool") {
+      const id = m.tool_call_id ?? "";
+      history.push({
+        role: "tool",
+        id,
+        content: [{
+          type: "tool-result",
+          toolCallId: id,
+          toolName: toolNames.get(id) ?? "",
+          result: contentToText(m.content),
+        }],
       });
-    } else if (msg.role === "user") {
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: "" });
-      }
-      pendingUser = contentToText(msg.content);
-    } else if (msg.role === "assistant") {
-      // Skip assistant messages that are just tool_calls with no text
-      const text = contentToText(msg.content);
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: text });
-        pendingUser = "";
-      }
     }
   }
-
-  let lastUserText = "";
-  if (pendingUser) {
-    lastUserText = pendingUser;
-  } else if (pairs.length > 0 && toolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
-  }
-
-  return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+  return { history, userText: userText.trim() ? userText : CONTINUE_PROMPT };
 }
 
 // --- MCP Tool Definitions ---
@@ -675,86 +711,27 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
 function buildCursorRequest(
   modelId: string,
   systemPrompt: string,
+  history: HistoryMessage[],
   userText: string,
-  turns: Array<{ userText: string; assistantText: string }>,
 ): CursorRequestPayload {
-  /* eslint-disable prefer-const */
+  // Every root-prompt message is a blob Cursor asks for back by its sha256
+  // (KV getBlobArgs); the system prompt leads, then the history in order.
   const blobStore = new Map<string, Uint8Array>();
+  const rootPromptMessagesJson: Uint8Array[] = [];
+  const addRoot = (message: object): number => {
+    const bytes = new TextEncoder().encode(JSON.stringify(message));
+    const id = new Uint8Array(createHash("sha256").update(bytes).digest());
+    blobStore.set(Buffer.from(id).toString("hex"), bytes);
+    rootPromptMessagesJson.push(id);
+    return bytes.length;
+  };
   // helm patch (2026-09-16): see CursorRequestPayload.promptChars.
-  const promptChars = systemPrompt.length + userText.length +
-    turns.reduce((n, t) => n + t.userText.length + t.assistantText.length, 0);
-
-  // helm patch (2026-09-16): CURSOR REJECTS OUR RECONSTRUCTED HISTORY.
-  // MEASURED, isolated direct against the bridge with the proxy bypassed: a
-  // single user message succeeds, and ANY request carrying prior turns comes
-  // back "Connect error failed_precondition". One user/assistant pair is
-  // enough to trigger it, so it is the turn STRUCTURE we synthesise here, not
-  // size, tool count, consecutive user roles or content shape (each of those
-  // was tested and cleared separately). Cursor's own client presumably fills
-  // fields of AgentConversationTurnStructure that we leave at their defaults,
-  // and we have no spec for them.
-  //
-  // Until that shape is known, FOLD the history into the outgoing user message
-  // as a plain transcript and send NO structured turns. This loses Cursor-side
-  // turn metadata and costs prompt tokens, but it preserves every word of the
-  // conversation and it WORKS — the alternative is a seat that cannot hold a
-  // second exchange, which is no seat at all. A real Claude Code seat carries
-  // history on literally every request after its first.
-  const FOLD_HISTORY = true;
-  if (FOLD_HISTORY && turns.length > 0) {
-    const transcript = turns
-      .map((t) =>
-        `<turn>\n<user>\n${t.userText}\n</user>` +
-        (t.assistantText ? `\n<assistant>\n${t.assistantText}\n</assistant>` : "") +
-        `\n</turn>`
-      )
-      .join("\n");
-    userText =
-      `The conversation so far, for context:\n\n${transcript}\n\n` +
-      `The latest message, which is the one to answer:\n\n${userText}`;
-    turns = [];
-  }
-
-  const turnBytes: Uint8Array[] = [];
-  for (const turn of turns) {
-    const userMsg = create(UserMessageSchema, {
-      text: turn.userText,
-      messageId: crypto.randomUUID(),
-    });
-    const userMsgBytes = toBinary(UserMessageSchema, userMsg);
-
-    const stepBytes: Uint8Array[] = [];
-    if (turn.assistantText) {
-      const step = create(ConversationStepSchema, {
-        message: {
-          case: "assistantMessage",
-          value: create(AssistantMessageSchema, { text: turn.assistantText }),
-        },
-      });
-      stepBytes.push(toBinary(ConversationStepSchema, step));
-    }
-
-    const agentTurn = create(AgentConversationTurnStructureSchema, {
-      userMessage: userMsgBytes,
-      steps: stepBytes,
-    });
-    const turnStructure = create(ConversationTurnStructureSchema, {
-      turn: { case: "agentConversationTurn", value: agentTurn },
-    });
-    turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
-  }
-
-  // System prompt → blob store (Cursor requests it back via KV handshake)
-  const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
-  const systemBytes = new TextEncoder().encode(systemJson);
-  const systemBlobId = new Uint8Array(
-    createHash("sha256").update(systemBytes).digest(),
-  );
-  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+  let promptChars = addRoot({ role: "system", content: systemPrompt }) + userText.length;
+  for (const message of history) promptChars += addRoot(message);
 
   const conversationState = create(ConversationStateStructureSchema, {
-    rootPromptMessagesJson: [systemBlobId],
-    turns: turnBytes,
+    rootPromptMessagesJson,
+    turns: [],
     todos: [],
     pendingToolCalls: [],
     previousWorkspaceUris: [],
@@ -1053,6 +1030,7 @@ function handleExecMessage(
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+    trace(`mcpArgs name=${mcpArgs.name} toolName=${mcpArgs.toolName} provider=${mcpArgs.providerIdentifier}`);
     const cursorToolCallId = mcpArgs.toolCallId || crypto.randomUUID();
     onMcpExec({
       execId: execMsg.execId,
@@ -1759,4 +1737,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, resumeRun, pausedRuns, limits };
+export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
