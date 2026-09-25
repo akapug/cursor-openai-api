@@ -256,6 +256,10 @@ interface Run {
   expiry: NodeJS.Timeout | null;
   /** Ends an attached run Cursor has gone silent on. */
   stall: NodeJS.Timeout | null;
+  /** The conversation's size in the model's window, as Cursor last reported it (0 = not yet). */
+  contextTokens: number;
+  /** Output tokens Cursor reported while no client was attached. */
+  heldOutputTokens: number;
 }
 
 /** Paused runs by the client-facing id of every tool call they await. */
@@ -874,6 +878,17 @@ function makeHeartbeatBytes(): Uint8Array {
 
 // --- Server Message Processing ---
 
+/**
+ * Token counts Cursor reports on the stream: `output` from each
+ * InteractionUpdate.token_delta (tokens generated since the last one), and
+ * `context` from a checkpoint's ConversationTokenDetails.used_tokens (the
+ * conversation's size in the model's window).
+ */
+interface TokenCounts {
+  output?: number;
+  context?: number;
+}
+
 function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -881,6 +896,7 @@ function processServerMessage(
   sendFrame: (data: Uint8Array) => void,
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
+  onTokens: (counts: TokenCounts) => void = () => {},
 ): void {
   const msgCase = msg.message.case;
   if (TRACE) {
@@ -892,7 +908,16 @@ function processServerMessage(
   }
 
   if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, onText);
+    const update = msg.message.value;
+    if (update.message.case === "tokenDelta") {
+      onTokens({ output: update.message.value.tokens });
+    }
+    handleInteractionUpdate(update, onText);
+  } else if (msgCase === "conversationCheckpointUpdate") {
+    const used = msg.message.value.tokenDetails?.usedTokens;
+    trace("checkpoint tokenDetails", msg.message.value.tokenDetails
+      ? `used=${used} max=${msg.message.value.tokenDetails.maxTokens}` : "absent");
+    if (used) onTokens({ context: used });
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
@@ -1224,6 +1249,8 @@ interface Sink {
   finish(reason: "stop" | "tool_calls", usage: Usage | null): void;
   /** Characters written to this response, for the usage estimate. */
   outChars: number;
+  /** Output tokens Cursor reported during this response. */
+  outputTokens: number;
 }
 
 /** Start a fresh Cursor run for this request and answer from it. */
@@ -1271,6 +1298,8 @@ async function startRun(
     closed: false,
     expiry: null,
     stall: null,
+    contextTokens: 0,
+    heldOutputTokens: 0,
   };
   trace(`run ${run.id} started (${modelId})`);
   return respond(run, stream, () => listen(run, peeked));
@@ -1309,6 +1338,7 @@ function feed(run: Run, chunk: Buffer): void {
         (data) => run.bridge.write(data),
         (text, isThinking) => emitText(run, text, Boolean(isThinking)),
         (exec) => onExec(run, exec),
+        (counts) => countTokens(run, counts),
       );
     } catch (err) {
       // One bad frame must not end the read loop — that loop is the only
@@ -1334,6 +1364,13 @@ function armStall(run: Run): void {
   }, limits.stallMs);
 }
 
+function countTokens(run: Run, counts: TokenCounts): void {
+  if (counts.context) run.contextTokens = counts.context;
+  if (!counts.output) return;
+  if (run.sink) run.sink.outputTokens += counts.output;
+  else run.heldOutputTokens += counts.output;
+}
+
 function emitText(run: Run, text: string, thinking: boolean): void {
   if (run.sink) run.sink.text(text, thinking);
   else run.held.push({ text, thinking });
@@ -1356,7 +1393,7 @@ function pause(run: Run): void {
   const sink = run.sink;
   run.sink = null;
   armStall(run);
-  sink?.finish("tool_calls", null);
+  if (sink) sink.finish("tool_calls", usageOf(run, sink));
   if (run.closed) return;
   for (const exec of run.awaiting) pausedRuns.set(exec.toolCallId, run);
   run.expiry = setTimeout(() => endRun(run, "no tool results came back"), limits.pausedTtlMs);
@@ -1376,7 +1413,7 @@ function onRunClosed(run: Run, code: number): void {
   }
   const sink = run.sink;
   run.sink = null;
-  sink?.finish("stop", estimateUsage(run, sink));
+  if (sink) sink.finish("stop", usageOf(run, sink));
 }
 
 /** Drop a run from the paused map and disarm its expiry. */
@@ -1486,6 +1523,8 @@ function resumeRun(
  */
 function attach(run: Run, sink: Sink): void {
   run.sink = sink;
+  sink.outputTokens += run.heldOutputTokens;
+  run.heldOutputTokens = 0;
   for (const h of run.held.splice(0)) sink.text(h.text, h.thinking);
   const queued = run.queued.splice(0);
   for (const exec of queued) {
@@ -1495,23 +1534,33 @@ function attach(run: Run, sink: Sink): void {
   if (queued.length) pause(run);
   else if (run.closed) {
     run.sink = null;
-    sink.finish("stop", estimateUsage(run, sink));
+    sink.finish("stop", usageOf(run, sink));
   }
   armStall(run);
 }
 
 /**
- * helm patch (2026-09-16): Cursor returns no token counts, so without this the
- * client gets usage {0,0} forever and autocompact never fires. ~4 chars per
- * token is the standard rough heuristic; it guards a context window, it is
- * not billing.
+ * The usage a response reports, which Claude Code's autocompact reads.
+ *
+ * helm patch (2026-09-25): REAL COUNTS WHERE CURSOR SENDS THEM. The
+ * 2026-09-16 patch estimated both sides at 4 chars/token on the belief that
+ * Cursor returns no token counts; it does. Every generated chunk is followed
+ * by an InteractionUpdate.token_delta, and each checkpoint carries
+ * ConversationTokenDetails.used_tokens, the conversation's size in the
+ * model's window. And a tool-call turn — most turns of a Claude Code seat —
+ * carried no usage at all, so its message_delta reached the client as 0/0
+ * (task/2640). Every terminal chunk now carries usage; the chars/4 estimate
+ * remains only for a side Cursor has not reported yet, and `helm_estimated`
+ * says whether it was used.
  */
-function estimateUsage(run: Run, sink: Sink): Usage {
+function usageOf(run: Run, sink: Sink): Usage {
+  const output = sink.outputTokens || Math.ceil(sink.outChars / 4);
+  const prompt = run.contextTokens || Math.ceil(run.promptChars / 4);
   return {
-    prompt_tokens: Math.ceil(run.promptChars / 4),
-    completion_tokens: Math.ceil(sink.outChars / 4),
-    total_tokens: Math.ceil((run.promptChars + sink.outChars) / 4),
-    helm_estimated: true,
+    prompt_tokens: prompt,
+    completion_tokens: output,
+    total_tokens: prompt + output,
+    helm_estimated: !sink.outputTokens || !run.contextTokens,
   };
 }
 
@@ -1570,6 +1619,7 @@ function sseResponse(run: Run, then: () => void): Response {
       let toolIndex = 0;
       const sink: Sink = {
         outChars: 0,
+        outputTokens: 0,
         text(text, isThinking) {
           sink.outChars += text.length;
           // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD, NOT
@@ -1638,6 +1688,7 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
   const toolCalls: OpenAIToolCall[] = [];
   const sink: Sink = {
     outChars: 0,
+    outputTokens: 0,
     // helm patch (2026-08-11): thinking and answer are two streams; keep them
     // apart. Measured: splicing them gave "I am Cursor G 4.5.rok.I am ...".
     text(text, isThinking) {

@@ -9,6 +9,9 @@ import {
   McpArgsSchema,
   TextDeltaUpdateSchema,
   ThinkingDeltaUpdateSchema,
+  TokenDeltaUpdateSchema,
+  ConversationStateStructureSchema,
+  ConversationTokenDetailsSchema,
   type AgentServerMessage,
 } from "../src/proto/agent_pb";
 
@@ -50,6 +53,28 @@ export function textDelta(text: string, thinking = false): AgentServerMessage {
         message: thinking
           ? { case: "thinkingDelta", value: create(ThinkingDeltaUpdateSchema, { text }) }
           : { case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) },
+      }),
+    },
+  });
+}
+
+export function tokenDelta(tokens: number): AgentServerMessage {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens }) },
+      }),
+    },
+  });
+}
+
+export function checkpoint(usedTokens: number): AgentServerMessage {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "conversationCheckpointUpdate",
+      value: create(ConversationStateStructureSchema, {
+        tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens, maxTokens: 256_000 }),
       }),
     },
   });
@@ -97,6 +122,8 @@ export function makeRun(bridge: ReturnType<typeof fakeBridge>["bridge"], id = 1)
     closed: false,
     expiry: null,
     stall: null,
+    contextTokens: 0,
+    heldOutputTokens: 0,
   } as never;
 }
 
