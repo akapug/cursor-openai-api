@@ -403,7 +403,16 @@ export async function startProxy(
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
         const accessToken = await getAccessToken();
-        const cursorModels = await getCursorModels(accessToken);
+        let cursorModels: Awaited<ReturnType<typeof getCursorModels>>;
+        try {
+          cursorModels = await getCursorModels(accessToken);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(
+            JSON.stringify({ error: { message, type: "upstream_error", code: "model_discovery_failed" } }),
+            { status: 502, headers: { "Content-Type": "application/json" } },
+          );
+        }
         const openAIModels = cursorModels.map((m) => ({
           id: m.id,
           object: "model",

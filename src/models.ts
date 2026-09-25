@@ -1,7 +1,7 @@
 /**
  * Cursor model discovery via GetUsableModels gRPC endpoint.
  * Uses curl for HTTP/2 transport (Bun's node:http2 is broken).
- * Falls back to a hardcoded list if the endpoint is unreachable.
+ * Fails loudly if the endpoint is unreachable: there is no fallback list.
  */
 import { execSync } from "node:child_process";
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
@@ -56,17 +56,6 @@ export interface CursorModel {
   maxTokens: number;
 }
 
-// --- Hardcoded fallback models ---
-
-const FALLBACK_MODELS: CursorModel[] = [
-  { id: "composer-2", name: "Composer 2", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4-sonnet", name: "Claude 4 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-3.5-sonnet", name: "Claude 3.5 Sonnet", reasoning: false, contextWindow: 200_000, maxTokens: 8_192 },
-  { id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128_000, maxTokens: 16_384 },
-  { id: "cursor-small", name: "Cursor Small", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
-];
-
 export interface CursorModelDiscoveryOptions {
   apiKey: string;
   baseUrl?: string;
@@ -76,7 +65,7 @@ export interface CursorModelDiscoveryOptions {
 
 /**
  * Fetch models from Cursor's GetUsableModels gRPC endpoint.
- * Returns null on failure (caller should use fallback list).
+ * Returns null on failure.
  */
 export async function fetchCursorUsableModels(
   options: CursorModelDiscoveryOptions,
@@ -101,13 +90,23 @@ export async function fetchCursorUsableModels(
 }
 
 /**
- * Get cursor models: try dynamic discovery, fall back to hardcoded list.
+ * The models this account can use, from Cursor itself.
+ *
+ * helm patch (2026-09-25): NO SILENT FALLBACK LIST. On any discovery failure
+ * this returned six hardcoded models (composer-2, claude-4-sonnet, gpt-4o...),
+ * so a bridge that could not reach Cursor, or held a dead token, still
+ * answered /v1/models with a plausible list, and bridge.sh's health check
+ * (which asks exactly that endpoint) reported it up. A failure is an error.
  */
 export async function getCursorModels(
   apiKey: string,
+  discover: typeof fetchCursorUsableModels = fetchCursorUsableModels,
 ): Promise<CursorModel[]> {
-  const discovered = await fetchCursorUsableModels({ apiKey });
-  return discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  const discovered = await discover({ apiKey });
+  if (!discovered || discovered.length === 0) {
+    throw new Error("Cursor model discovery failed (GetUsableModels returned nothing usable)");
+  }
+  return discovered;
 }
 
 // --- Internal helpers ---
