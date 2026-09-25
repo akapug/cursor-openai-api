@@ -18,8 +18,6 @@
 import http2 from "node:http2";
 import crypto from "node:crypto";
 
-const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
-
 /** Write one length-prefixed message to stdout. */
 function writeMessage(data) {
   const lenBuf = Buffer.alloc(4);
@@ -80,7 +78,13 @@ const configBuf = await readMessage();
 if (!configBuf) process.exit(1);
 
 const config = JSON.parse(configBuf.toString("utf8"));
-const { accessToken, url, path: rpcPath } = config;
+// clientVersion comes from the parent (models.ts CURSOR_CLIENT_VERSION): one
+// string for the whole bridge, not a second copy that drifts here.
+const { accessToken, url, path: rpcPath, clientVersion } = config;
+if (!clientVersion) {
+  process.stderr.write("[h2] config carries no clientVersion\n");
+  process.exit(2);
+}
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
@@ -111,7 +115,7 @@ const h2Stream = client.request({
   te: "trailers",
   authorization: `Bearer ${accessToken}`,
   "x-ghost-mode": "true",
-  "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+  "x-cursor-client-version": clientVersion,
   "x-cursor-client-type": "cli",
   "x-request-id": crypto.randomUUID(),
 });

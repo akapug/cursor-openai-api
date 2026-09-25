@@ -15,7 +15,15 @@ import {
 } from "./proto/agent_pb";
 
 const CURSOR_BASE_URL = "https://api2.cursor.sh";
-const CURSOR_CLIENT_VERSION = "cli-2026.02.13-41ac335";
+/**
+ * The Cursor CLI version this bridge presents, for model discovery here AND
+ * for the agent stream (h2-bridge.mjs receives it in its config). helm patch
+ * (2026-09-25): the two files each carried their own string
+ * (cli-2026.02.13-41ac335 here, cli-2026.01.09-231024f in the h2 child), so
+ * the bridge introduced itself as two different clients. Measured: both
+ * versions list the same 241 models, grok-4.7-* included; the newer is kept.
+ */
+export const CURSOR_CLIENT_VERSION = "cli-2026.02.13-41ac335";
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;

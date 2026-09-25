@@ -1,8 +1,10 @@
 // helm arm (2026-09-25): the bridge spends the owner's Cursor account and
-// takes no credential from its callers, so it listens on loopback only; and
-// a failed model discovery is an error, never a made-up list.
+// takes no credential from its callers, so it listens on loopback only; a
+// failed model discovery is an error, never a made-up list; and the h2 child
+// refuses to start without the one client-version string the parent owns.
 import { afterAll, describe, expect, test } from "bun:test";
 import { networkInterfaces } from "node:os";
+import { resolve } from "node:path";
 import { getCursorModels } from "../src/models";
 import { startProxy, stopProxy } from "../src/proxy";
 
@@ -26,5 +28,19 @@ describe("bridge safety", () => {
     await expect(getCursorModels("k", async () => [])).rejects.toThrow(/discovery failed/);
     const real = [{ id: "grok-4.7-high", name: "Grok", reasoning: true, contextWindow: 1, maxTokens: 1 }];
     expect(await getCursorModels("k", async () => real)).toEqual(real);
+  });
+
+  test("the h2 child will not start without the parent's client version", async () => {
+    const child = Bun.spawn(["node", resolve(import.meta.dir, "../src/h2-bridge.mjs")], {
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    const cfg = new TextEncoder().encode(JSON.stringify({ accessToken: "t", url: "http://127.0.0.1:9", path: "/x" }));
+    const b = Buffer.alloc(4 + cfg.length);
+    b.writeUInt32BE(cfg.length, 0);
+    b.set(cfg, 4);
+    child.stdin.write(b);
+    await child.stdin.flush();
+    expect(await child.exited).toBe(2);
+    expect(await new Response(child.stderr).text()).toContain("no clientVersion");
   });
 });

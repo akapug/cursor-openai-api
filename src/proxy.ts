@@ -14,7 +14,7 @@
  * because Bun's node:http2 module is broken.
  */
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
-import { getCursorModels } from "./models";
+import { CURSOR_CLIENT_VERSION, getCursorModels } from "./models";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import {
@@ -326,6 +326,7 @@ function spawnBridge(accessToken: string): {
     accessToken,
     url: CURSOR_API_URL,
     path: "/agent.v1.AgentService/Run",
+    clientVersion: CURSOR_CLIENT_VERSION,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
 
