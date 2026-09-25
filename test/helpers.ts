@@ -96,6 +96,7 @@ export function makeRun(bridge: ReturnType<typeof fakeBridge>["bridge"], id = 1)
     pending: Buffer.alloc(0),
     closed: false,
     expiry: null,
+    stall: null,
   } as never;
 }
 

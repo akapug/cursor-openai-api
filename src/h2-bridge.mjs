@@ -84,15 +84,20 @@ const { accessToken, url, path: rpcPath } = config;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
-const timeout = setTimeout(() => {
-  client.destroy();
+// helm patch (2026-09-25): NO WALL-CLOCK DEADLINE ON THE STREAM. This child
+// used to kill itself 120 s after spawn whatever was happening, so any Cursor
+// run longer than two minutes — a long think, or a run paused while the
+// client executes a tool — was cut off and ended as a clean "stop" with no
+// answer. A run's lifetime belongs to the parent, which knows whether it is
+// streaming, paused or abandoned; this child ends when the parent closes
+// stdin, when Cursor ends the stream, or on a transport error, and says why
+// on stderr.
+const fail = (what, err) => {
+  process.stderr.write(`[h2] ${what}: ${err?.code ?? ""} ${err?.message ?? err}\n`);
   process.exit(1);
-}, 120_000);
+};
 
-client.on("error", () => {
-  clearTimeout(timeout);
-  process.exit(1);
-});
+client.on("error", (err) => fail("session error", err));
 
 const h2Stream = client.request({
   ":method": "POST",
@@ -113,16 +118,14 @@ h2Stream.on("data", (chunk) => {
 });
 
 h2Stream.on("end", () => {
-  clearTimeout(timeout);
   client.close();
   // Give stdout time to flush
   setTimeout(() => process.exit(0), 100);
 });
 
-h2Stream.on("error", () => {
-  clearTimeout(timeout);
+h2Stream.on("error", (err) => {
   client.close();
-  process.exit(1);
+  fail("stream error", err);
 });
 
 // Forward stdin → H2 stream (after config message)
@@ -130,7 +133,12 @@ h2Stream.on("error", () => {
   while (true) {
     const msg = await readMessage();
     if (!msg || msg.length === 0) {
-      // EOF or zero-length = done writing
+      // EOF or zero-length = the parent is done with this run. Close our half
+      // and leave: before, the loop just stopped reading and the child stayed
+      // up holding the Cursor stream until Cursor or the old timer ended it.
+      if (!h2Stream.closed && !h2Stream.destroyed) h2Stream.close();
+      client.close();
+      setTimeout(() => process.exit(0), 100);
       break;
     }
     if (!h2Stream.closed && !h2Stream.destroyed) {

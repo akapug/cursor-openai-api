@@ -79,7 +79,7 @@ const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 // case to stderr, so a stall can be read off the log instead of guessed at.
 const TRACE = process.env.CURSOR_BRIDGE_TRACE === "1";
 function trace(...parts: unknown[]): void {
-  if (TRACE) console.error("[trace]", ...parts);
+  if (TRACE) console.error("[trace]", new Date().toISOString().slice(11, 23), ...parts);
 }
 
 /**
@@ -254,18 +254,31 @@ interface Run {
   closed: boolean;
   /** Ends a paused run nobody came back for. */
   expiry: NodeJS.Timeout | null;
+  /** Ends an attached run Cursor has gone silent on. */
+  stall: NodeJS.Timeout | null;
 }
 
 /** Paused runs by the client-facing id of every tool call they await. */
 const pausedRuns = new Map<string, Run>();
 let runSerial = 0;
 
-/**
- * A paused run nobody resumes (the client was interrupted, crashed, or went
- * another way) is ended after this long. Claude Code's own Bash tool caps a
- * command at 10 minutes, so a live tool loop always comes back before it.
- */
-const PAUSED_RUN_TTL_MS = 15 * 60_000;
+/** Run lifetimes, read at call time (tests shorten them). */
+const limits = {
+  /**
+   * A paused run nobody resumes (the client was interrupted, crashed, or went
+   * another way) is ended after this long. Claude Code's own Bash tool caps a
+   * command at 10 minutes, so a live tool loop always comes back before it.
+   */
+  pausedTtlMs: 15 * 60_000,
+  /**
+   * helm patch (2026-09-25): while a client is attached and waiting, Cursor
+   * sends SOMETHING every few seconds — deltas, or an interaction heartbeat
+   * about every 10 s even when it is stuck. This much silence means the
+   * stream is dead, and the client is told so in words instead of hanging
+   * until an idle timeout turns it into an empty 500.
+   */
+  stallMs: 90_000,
+};
 
 // --- H2 Bridge IPC ---
 
@@ -300,7 +313,9 @@ function spawnBridge(accessToken: string): {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
-    stderr: "ignore",
+    // helm patch (2026-09-25): the child says why it died; that line belongs
+    // in the bridge log, not in /dev/null.
+    stderr: "inherit",
   });
 
   const config = JSON.stringify({
@@ -1255,6 +1270,7 @@ async function startRun(
     pending: Buffer.alloc(0),
     closed: false,
     expiry: null,
+    stall: null,
   };
   trace(`run ${run.id} started (${modelId})`);
   return respond(run, stream, () => listen(run, peeked));
@@ -1304,6 +1320,18 @@ function feed(run: Run, chunk: Buffer): void {
   // Execs that arrive in one chunk are one batch: pause once, after all of
   // them are on the wire, so parallel tool calls reach the client together.
   if (run.pauseAfterChunk) pause(run);
+  armStall(run);
+}
+
+/** (Re)start the silence watchdog while a client waits on this run; clear it otherwise. */
+function armStall(run: Run): void {
+  if (run.stall) clearTimeout(run.stall);
+  run.stall = null;
+  if (!run.sink || run.closed) return;
+  run.stall = setTimeout(() => {
+    emitText(run, `\n[Error: Cursor sent nothing for ${limits.stallMs / 1000} s; the bridge ended this run]`, false);
+    endRun(run, "stalled");
+  }, limits.stallMs);
 }
 
 function emitText(run: Run, text: string, thinking: boolean): void {
@@ -1327,10 +1355,11 @@ function pause(run: Run): void {
   run.pauseAfterChunk = false;
   const sink = run.sink;
   run.sink = null;
+  armStall(run);
   sink?.finish("tool_calls", null);
   if (run.closed) return;
   for (const exec of run.awaiting) pausedRuns.set(exec.toolCallId, run);
-  run.expiry = setTimeout(() => endRun(run, "no tool results came back"), PAUSED_RUN_TTL_MS);
+  run.expiry = setTimeout(() => endRun(run, "no tool results came back"), limits.pausedTtlMs);
   trace(`run ${run.id} paused awaiting ${run.awaiting.map((e) => e.toolCallId).join(",")}`);
 }
 
@@ -1339,6 +1368,7 @@ function onRunClosed(run: Run, code: number): void {
   run.closed = true;
   clearInterval(run.heartbeatTimer);
   forget(run);
+  armStall(run);
   trace(`run ${run.id} closed (code ${code})`);
   if (run.pauseAfterChunk) {
     pause(run);
@@ -1467,6 +1497,7 @@ function attach(run: Run, sink: Sink): void {
     run.sink = null;
     sink.finish("stop", estimateUsage(run, sink));
   }
+  armStall(run);
 }
 
 /**
@@ -1585,6 +1616,7 @@ function sseResponse(run: Run, then: () => void): Response {
       // request can ever come back for it, so end it rather than let it run.
       if (mine && run.sink === mine) {
         run.sink = null;
+        armStall(run);
         endRun(run, "client disconnected");
       }
     },
@@ -1644,4 +1676,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, resumeRun, pausedRuns };
+export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, resumeRun, pausedRuns, limits };
