@@ -6,7 +6,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fetchCursorUsableModels, getCursorModels } from "../src/models";
+import { curlHeaderConfig, fetchCursorUsableModels, getCursorModels } from "../src/models";
 import { startProxy, stopProxy } from "../src/proxy";
 
 afterAll(() => stopProxy());
@@ -63,6 +63,11 @@ describe("bridge safety", () => {
     expect(argv).toContain("--http2");                 // the fake WAS the curl that ran
     expect(argv).not.toContain(secret);
     expect(readFileSync(join(dir, "stdin"), "utf8")).toContain(`Bearer ${secret}`);
+  });
+
+  test("the curl header config escapes what curl's config syntax reads", () => {
+    expect(curlHeaderConfig({ a: 'x"y\\z', b: "plain" }))
+      .toBe('header = "a: x\\"y\\\\z"\nheader = "b: plain"\n');
   });
 
   test("the h2 child will not start without the parent's client version", async () => {

@@ -3,7 +3,7 @@
  * Uses curl for HTTP/2 transport (Bun's node:http2 is broken).
  * Fails loudly if the endpoint is unreachable: there is no fallback list.
  */
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -135,8 +135,23 @@ function buildRequestHeaders(
 
 
 /**
+ * The request headers as a curl config (`-K`) body: one `header = "..."` line
+ * each, with backslash and double quote escaped as curl's config syntax wants.
+ */
+export function curlHeaderConfig(headers: Record<string, string>): string {
+  return Object.entries(headers)
+    .map(([k, v]) => `header = "${`${k}: ${v}`.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`)
+    .join("\n") + "\n";
+}
+
+/**
  * HTTP/2 transport via curl (Bun's node:http2 doesn't work with Cursor's API).
  * Writes request body to a temp file, invokes curl --http2, reads response.
+ *
+ * helm patch (2026-09-25): THE TOKEN NEVER RIDES ARGV. The headers, the
+ * bearer among them, used to be `-H` arguments, and /proc/<pid>/cmdline is
+ * readable by every local user for as long as curl runs. They go to curl on
+ * stdin as a config (`-K -`) now, and curl runs without a shell.
  */
 async function fetchViaHttp2(
   baseUrl: string,
@@ -149,21 +164,20 @@ async function fetchViaHttp2(
   try {
     writeFileSync(reqPath, body);
     const headers = buildRequestHeaders(options);
-    const headerArgs = Object.entries(headers)
-      .flatMap(([k, v]) => ["-H", `${k}: ${v}`]);
     const timeoutSecs = Math.ceil(timeoutMs / 1000);
     const url = `${baseUrl}${GET_USABLE_MODELS_PATH}`;
     const args = [
-      "curl", "-s", "--http2",
+      "-s", "--http2",
       "--max-time", String(timeoutSecs),
       "-X", "POST",
-      ...headerArgs,
+      "-K", "-",
       "--data-binary", `@${reqPath}`,
       "-o", respPath,
       "-w", "%{http_code}",
       url,
     ];
-    const status = execSync(args.map(a => a.includes(' ') ? `"${a}"` : a).join(' '), {
+    const status = execFileSync("curl", args, {
+      input: curlHeaderConfig(headers),
       timeout: timeoutMs + 2000,
       stdio: ["pipe", "pipe", "pipe"],
     }).toString().trim();
