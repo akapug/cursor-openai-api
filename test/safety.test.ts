@@ -3,9 +3,10 @@
 // failed model discovery is an error, never a made-up list; and the h2 child
 // refuses to start without the one client-version string the parent owns.
 import { afterAll, describe, expect, test } from "bun:test";
-import { networkInterfaces } from "node:os";
-import { resolve } from "node:path";
-import { getCursorModels } from "../src/models";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { networkInterfaces, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fetchCursorUsableModels, getCursorModels } from "../src/models";
 import { startProxy, stopProxy } from "../src/proxy";
 
 afterAll(() => stopProxy());
@@ -28,6 +29,40 @@ describe("bridge safety", () => {
     await expect(getCursorModels("k", async () => [])).rejects.toThrow(/discovery failed/);
     const real = [{ id: "grok-4.7-high", name: "Grok", reasoning: true, contextWindow: 1, maxTokens: 1 }];
     expect(await getCursorModels("k", async () => real)).toEqual(real);
+  });
+
+  test("model discovery never puts the Cursor token on curl's command line", async () => {
+    // A stand-in curl first on PATH records its argv and its stdin, then answers
+    // 200 with an empty body. /proc/<pid>/cmdline is readable by every local
+    // user, so a bearer there is a bearer anyone on the box can copy. The
+    // discovery runs in a child bun whose PATH is set at its start, the way the
+    // supervisor starts the bridge.
+    const dir = mkdtempSync(join(tmpdir(), "fake-curl-"));
+    const fake = join(dir, "curl");
+    writeFileSync(fake, [
+      "#!/bin/sh",
+      `printf '%s\\n' "$@" > "${dir}/argv"`,
+      `cat > "${dir}/stdin"`,
+      'out=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done',
+      '[ -n "$out" ] && : > "$out"',
+      "printf 200",
+      "",
+    ].join("\n"));
+    chmodSync(fake, 0o755);
+    const secret = "SECRET-TOKEN-MARKER-7f3c";
+    const models = resolve(import.meta.dir, "../src/models.ts");
+    const child = Bun.spawn([process.execPath, "-e",
+      `const m = await import(${JSON.stringify(models)});` +
+      `await m.fetchCursorUsableModels({ apiKey: ${JSON.stringify(secret)}, ` +
+      `baseUrl: "http://127.0.0.1:9", timeoutMs: 2000 });`], {
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+      stdout: "pipe", stderr: "pipe",
+    });
+    expect(await child.exited).toBe(0);
+    const argv = readFileSync(join(dir, "argv"), "utf8");
+    expect(argv).toContain("--http2");                 // the fake WAS the curl that ran
+    expect(argv).not.toContain(secret);
+    expect(readFileSync(join(dir, "stdin"), "utf8")).toContain(`Bearer ${secret}`);
   });
 
   test("the h2 child will not start without the parent's client version", async () => {
