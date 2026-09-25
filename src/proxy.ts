@@ -197,7 +197,10 @@ interface CursorRequestPayload {
 interface PendingExec {
   execId: string;
   execMsgId: number;
+  /** The id the CLIENT sees and sends back: [A-Za-z0-9_-] only. */
   toolCallId: string;
+  /** Cursor's own id for the call (may carry "\n"); kept for logs. */
+  cursorToolCallId: string;
   toolName: string;
   /** Decoded arguments JSON string for SSE tool_calls emission. */
   decodedArgs: string;
@@ -979,10 +982,12 @@ function handleExecMessage(
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+    const cursorToolCallId = mcpArgs.toolCallId || crypto.randomUUID();
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
-      toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
+      toolCallId: clientToolCallId(cursorToolCallId),
+      cursorToolCallId,
       toolName: mcpArgs.toolName || mcpArgs.name,
       decodedArgs: JSON.stringify(decoded),
     });
@@ -1135,6 +1140,25 @@ function handleExecMessage(
 
   // Unknown exec type — log and ignore
   console.error(`[proxy] unhandled exec: ${execCase ?? `unknown(${unknownFields(execMsg)})`}`);
+}
+
+/**
+ * helm patch (2026-09-25): THE TOOL-CALL ID THE CLIENT SEES MUST SURVIVE THE
+ * ROUND TRIP. Cursor's ids carry a newline — MEASURED on grok-4.7-high:
+ * "call-<uuid>-1\nfc_<uuid>_0". This bridge handed that id out raw;
+ * CLIProxyAPI rewrites every character outside [A-Za-z0-9_-] to "_" on the
+ * way to Claude Code (util/claude_tool_id.go), Claude Code sends the rewritten
+ * id back with the tool result, and the resume path matched by exact equality.
+ * Every match missed, every tool result went to Cursor as "Tool result not
+ * provided", and the model said so. MEASURED, same request: "The tool
+ * execution failed. Retrying now." with MARKER-42 sitting in the result it
+ * was never given. Emit ids already in Claude's alphabet, and compare the
+ * client's id through the same function, so an id that was rewritten on the
+ * way out and one that was not both land on the pending exec.
+ */
+function clientToolCallId(id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+  return safe || `call_${crypto.randomUUID().replace(/-/g, "")}`;
 }
 
 /** Send an exec client message back to Cursor. */
@@ -1431,7 +1455,7 @@ function handleToolResultResume(
   // Send mcpResult for each pending exec that has a matching tool result
   for (const exec of pendingExecs) {
     const result = toolResults.find(
-      (r) => r.toolCallId === exec.toolCallId,
+      (r) => clientToolCallId(r.toolCallId) === exec.toolCallId,
     );
     const mcpResult = result
       ? create(McpResultSchema, {
@@ -1814,4 +1838,4 @@ async function collectFullResponse(
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { peekFirstFrame, connectRefusal, handleExecMessage };
+export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, handleToolResultResume };
