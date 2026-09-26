@@ -178,16 +178,6 @@ interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
-  /**
-   * helm patch (2026-09-16): character count of everything we send upstream.
-   * Cursor returns NO token counts, so the bridge reported no `usage` at all and
-   * CLIProxyAPI fell back to a hardcoded zero (openai_claude_response.go:405).
-   * A permanent usage of zero means Claude Code's autocompact — which keys on
-   * input_tokens — can NEVER fire, so the seat runs until it hits a hard context
-   * wall with no warning. An ESTIMATE is far better than a zero here: the number
-   * guards a context window, it is not billing.
-   */
-  promptChars: number;
   /** The client conversation this request carries (`conversationStamp`). */
   conversation?: ConversationStamp;
 }
@@ -245,13 +235,6 @@ interface Run {
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
-  /**
-   * helm patch (2026-09-16, ds4pro review F4): the conversation's prompt size,
-   * carried across the tool round-trip. The resume path counted only the tool
-   * RESULT text, so reported input_tokens collapsed after any live-bridge tool
-   * call and autocompact went quiet precisely when the window was fullest.
-   */
-  promptChars: number;
   /** Tool calls handed to the client whose results have not come back. */
   awaiting: PendingExec[];
   /** Tool calls Cursor asked for while no client request was attached. */
@@ -273,7 +256,7 @@ interface Run {
    * The conversation's size in the model's window, as Cursor reported it
    * during the response now attached (0 = not yet). Reset when a paused run
    * resumes: a checkpoint belongs to the response it arrived in, and a
-   * response that gets none reports the estimate, never an earlier figure.
+   * response that gets none reports the conversation's last count (usageOf).
    */
   contextTokens: number;
   /** The client conversation this run holds; absent = unknown, not vetoed. */
@@ -757,16 +740,14 @@ function buildCursorRequest(
   // (KV getBlobArgs); the system prompt leads, then the history in order.
   const blobStore = new Map<string, Uint8Array>();
   const rootPromptMessagesJson: Uint8Array[] = [];
-  const addRoot = (message: object): number => {
+  const addRoot = (message: object): void => {
     const bytes = new TextEncoder().encode(JSON.stringify(message));
     const id = new Uint8Array(createHash("sha256").update(bytes).digest());
     blobStore.set(Buffer.from(id).toString("hex"), bytes);
     rootPromptMessagesJson.push(id);
-    return bytes.length;
   };
-  // helm patch (2026-09-16): see CursorRequestPayload.promptChars.
-  let promptChars = addRoot({ role: "system", content: systemPrompt }) + userText.length;
-  for (const message of history) promptChars += addRoot(message);
+  addRoot({ role: "system", content: systemPrompt });
+  for (const message of history) addRoot(message);
 
   const conversationState = create(ConversationStateStructureSchema, {
     rootPromptMessagesJson,
@@ -815,7 +796,6 @@ function buildCursorRequest(
     requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
     blobStore,
     mcpTools: [],
-    promptChars,
   };
 }
 
@@ -1369,7 +1349,8 @@ interface Usage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  helm_estimated: boolean;
+  /** Whose checkpoint `prompt_tokens` is: this response's, or the conversation's last. */
+  helm_context: "response" | "conversation";
 }
 
 /** Where a run's output goes while a client request is attached to it. */
@@ -1380,8 +1361,6 @@ interface Sink {
   finish(reason: "stop" | "tool_calls", usage: Usage | null): void;
   /** Ends the client response with Cursor's Connect error (see `fail`). */
   fail(err: Error): void;
-  /** Characters written to this response, for the usage estimate. */
-  outChars: number;
   /** Output tokens Cursor reported during this response. */
   outputTokens: number;
 }
@@ -1412,7 +1391,6 @@ async function startRun(
     heartbeatTimer,
     blobStore: payload.blobStore,
     mcpTools: payload.mcpTools,
-    promptChars: payload.promptChars,
     awaiting: [],
     queued: [],
     held: [],
@@ -1521,7 +1499,10 @@ function armStall(run: Run): void {
 }
 
 function countTokens(run: Run, counts: TokenCounts): void {
-  if (counts.context) run.contextTokens = counts.context;
+  if (counts.context) {
+    run.contextTokens = counts.context;
+    rememberContext(run, counts.context);
+  }
   if (!counts.output) return;
   if (run.sink) run.sink.outputTokens += counts.output;
   else run.heldOutputTokens += counts.output;
@@ -1657,7 +1638,7 @@ function resumeRun(
 ): Response | Promise<Response> | null {
   forget(run);
   if (run.closed) return null;
-  run.contextTokens = 0;   // this response reports only its own checkpoints
+  run.contextTokens = 0;   // a checkpoint belongs to the response it arrives in
   const answered = run.awaiting.map((exec) => toolResults.find(
     (r) => clientToolCallId(r.toolCallId) === exec.toolCallId,
   ));
@@ -1673,8 +1654,7 @@ function resumeRun(
   }
   for (const [i, exec] of run.awaiting.entries()) {
     const result = answered[i];
-    if (result) run.promptChars += result.content.length;
-    else console.error(`[bridge] run ${run.id}: no result for tool call ${exec.toolCallId}`);
+    if (!result) console.error(`[bridge] run ${run.id}: no result for tool call ${exec.toolCallId}`);
     const mcpResult = result
       ? create(McpResultSchema, {
           result: {
@@ -1765,33 +1745,60 @@ function attach(run: Run, sink: Sink): void {
 }
 
 /**
- * The usage a response reports, which Claude Code's autocompact reads.
- *
- * helm patch (2026-09-25): REAL COUNTS WHERE CURSOR SENDS THEM. The
- * 2026-09-16 patch estimated both sides at 4 chars/token on the belief that
- * Cursor returns no token counts; it does. Every generated chunk is followed
- * by an InteractionUpdate.token_delta, and each checkpoint carries
- * ConversationTokenDetails.used_tokens, the conversation's size in the
- * model's window. And a tool-call turn — most turns of a Claude Code seat —
- * carried no usage at all, so its message_delta reached the client as 0/0
- * (task/2640). Every terminal chunk now carries usage; the chars/4 estimate
- * remains only for a side Cursor has not reported yet, and `helm_estimated`
- * says whether it was used.
- *
- * ONLY THIS RESPONSE'S COUNTS. A resumed run used to report its last
- * checkpoint from an EARLIER response when the resumed one received none:
- * measured on the live seat, 141,519 and then 149,317 twice after
- * compactions, which kept Claude Code compacting. `contextTokens` is reset
- * when a run resumes, so a response with no checkpoint reports the estimate.
+ * Cursor's last context count for each client conversation, by the
+ * conversation stamp's head (the first user message's digest), newest last.
+ * A compaction rewrites the first user message, so a compacted conversation
+ * has a new head and never inherits the old one's count. Bounded: the oldest
+ * conversation is dropped past CONVERSATIONS_KEPT.
  */
-function usageOf(run: Run, sink: Sink): Usage {
-  const output = sink.outputTokens || Math.ceil(sink.outChars / 4);
-  const prompt = run.contextTokens || Math.ceil(run.promptChars / 4);
+const conversationContext = new Map<string, number>();
+const CONVERSATIONS_KEPT = 256;
+
+function rememberContext(run: Run, tokens: number): void {
+  const head = run.conversation?.head;
+  if (!head) return;
+  conversationContext.delete(head);
+  conversationContext.set(head, tokens);
+  if (conversationContext.size > CONVERSATIONS_KEPT) {
+    conversationContext.delete(conversationContext.keys().next().value!);
+  }
+}
+
+/**
+ * The usage a response reports, which Claude Code's autocompact reads, or
+ * null for none.
+ *
+ * helm patch (2026-09-25): REAL COUNTS WHERE CURSOR SENDS THEM. Every
+ * generated chunk is followed by an InteractionUpdate.token_delta, and each
+ * checkpoint carries ConversationTokenDetails.used_tokens, the
+ * conversation's size in the model's window. A tool-call turn — most turns of
+ * a Claude Code seat — used to carry no usage at all (task/2640).
+ *
+ * helm patch (2026-09-26): NO ESTIMATE IS EVER USAGE. A response that got no
+ * checkpoint reported ceil(promptChars / 4), the UTF-8 bytes of every
+ * root-prompt blob over four, which overstates Cursor's count several times
+ * over. MEASURED on the cursor seat: two fresh-request responses four minutes
+ * apart on the same conversation reported 94,263 (no checkpoint) and 48,828
+ * (a checkpoint), the resumed response between them 48,002; an earlier one
+ * reported 397,729 where Cursor's own count was 79,652. Claude Code read the
+ * guess as the window and compacted on it. A fresh response that pauses on a
+ * tool call before Cursor sends any checkpoint is the usual case, since
+ * Cursor checkpoints after a tool call completes.
+ *
+ * So `prompt_tokens` is this response's own checkpoint, else the last count
+ * Cursor sent for the same client conversation (`conversationContext`), and
+ * with neither the response carries no usage. Output is what token_delta
+ * counted. `helm_context` says whose checkpoint the prompt count is.
+ */
+function usageOf(run: Run, sink: Sink): Usage | null {
+  const carried = run.conversation ? conversationContext.get(run.conversation.head) : undefined;
+  const prompt = run.contextTokens || carried;
+  if (!prompt) return null;
   return {
     prompt_tokens: prompt,
-    completion_tokens: output,
-    total_tokens: prompt + output,
-    helm_estimated: !sink.outputTokens || !run.contextTokens,
+    completion_tokens: sink.outputTokens,
+    total_tokens: prompt + sink.outputTokens,
+    helm_context: run.contextTokens ? "response" : "conversation",
   };
 }
 
@@ -1849,10 +1856,8 @@ function sseResponse(run: Run, then: () => void): Response {
       let thinking = false;
       let toolIndex = 0;
       const sink: Sink = {
-        outChars: 0,
         outputTokens: 0,
         text(text, isThinking) {
-          sink.outChars += text.length;
           // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD, NOT
           // FENCED TEXT. `reasoning_content` on the delta is the OpenAI
           // convention CLIProxyAPI maps to an Anthropic thinking block
@@ -1932,12 +1937,10 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
   let reasoning = "";
   const toolCalls: OpenAIToolCall[] = [];
   const sink: Sink = {
-    outChars: 0,
     outputTokens: 0,
     // helm patch (2026-08-11): thinking and answer are two streams; keep them
     // apart. Measured: splicing them gave "I am Cursor G 4.5.rok.I am ...".
     text(text, isThinking) {
-      sink.outChars += text.length;
       if (isThinking) reasoning += text;
       else content += text;
     },
@@ -1976,4 +1979,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
+export const __test = { conversationContext, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };

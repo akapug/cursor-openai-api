@@ -124,7 +124,6 @@ export function makeRun(bridge: ReturnType<typeof fakeBridge>["bridge"], id = 1)
     heartbeatTimer: timer,
     blobStore: new Map(),
     mcpTools: [],
-    promptChars: 400,
     awaiting: [],
     queued: [],
     held: [],
