@@ -33,7 +33,11 @@ function resumeWith(toolCallIdSentBack: string) {
     toolName: "Bash",
     decodedArgs: "{}",
   });
+  // listened like every live run, so closing the bridge releases the
+  // resumed response's first-frame wait
+  __test.listen(run as never, { buf: Buffer.alloc(0), refusal: null, closedCode: null });
   __test.resumeRun(run as never, [{ toolCallId: toolCallIdSentBack, content: "MARKER-42\n" }], "", true);
+  fb.close();
   return mcpResultsOf(fb.writes);
 }
 

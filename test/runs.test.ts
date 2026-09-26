@@ -49,7 +49,9 @@ describe("paused runs", () => {
     expect(__test.findPausedRun(asked(sb.toolCalls[0]!.id))).toBe(b.run);
 
     // A's result goes to A's bridge only, and B stays paused.
-    const resp = __test.resumeRun(a.run, [{ toolCallId: sa.toolCalls[0]!.id, content: "A-OUT" }], "", true) as Response;
+    // resumeRun answers once the run's first frame shows Cursor accepted the
+    // results (resume-refusal.test.ts), so the response is awaited below
+    const resp = __test.resumeRun(a.run, [{ toolCallId: sa.toolCalls[0]!.id, content: "A-OUT" }], "", true);
     expect(resp).not.toBeNull();
     expect(resultsWritten(a.fb.writes).map((r) => r.result.case)).toEqual(["success"]);
     expect(b.fb.writes.length).toBe(0);
@@ -57,7 +59,7 @@ describe("paused runs", () => {
     expect(b.fb.state.killed).toBe(false);
     a.fb.feed(frame(textDelta("A saw A-OUT")));
     a.fb.close();
-    expect((await readSse(resp)).content).toBe("A saw A-OUT");
+    expect((await readSse(await resp!)).content).toBe("A saw A-OUT");
   });
 
   test("tool messages before the last assistant message never resume a run", async () => {
@@ -109,6 +111,7 @@ describe("paused runs", () => {
     const text = (r!.result.value as { content: { content: { value: { text: string } } }[] }).content[0]!.content.value.text;
     expect(text).toContain("one");
     expect(text).toContain("<user_message>\nstop and summarize\n</user_message>");
+    a.fb.close();
   });
 
   test("a client that hangs up mid-answer ends the run instead of leaking it", async () => {
@@ -148,5 +151,6 @@ describe("paused runs", () => {
     expect((a.run as { expiry: unknown }).expiry).not.toBeNull();
     __test.resumeRun(a.run, [{ toolCallId: "call-1", content: "one" }], "", true);
     expect((a.run as { expiry: unknown }).expiry).toBeNull();
+    a.fb.close();
   });
 });

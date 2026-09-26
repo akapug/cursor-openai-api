@@ -38,10 +38,10 @@ describe("usage", () => {
     const { fb, run, resp } = started();
     fb.feed(frame(checkpoint(7710)), frame(tokenDelta(203)), frame(mcpCall(1, "call-1", "echo 1")));
     await readSse(resp);
-    const resumed = __test.resumeRun(run, [{ toolCallId: "call-1", content: "one" }], "", true) as Response;
+    const resumed = __test.resumeRun(run, [{ toolCallId: "call-1", content: "one" }], "", true);
     fb.feed(frame(checkpoint(7900)), frame(textDelta("done")), frame(tokenDelta(16)), frame(checkpoint(7944)));
     fb.close(0);
-    const s = await readSse(resumed);
+    const s = await readSse(await resumed!);
     expect(s.usage).toEqual({ prompt_tokens: 7944, completion_tokens: 16, total_tokens: 7960, helm_estimated: false });
   });
 
@@ -52,10 +52,10 @@ describe("usage", () => {
     const { fb, run, resp } = started();
     fb.feed(frame(checkpoint(141519)), frame(tokenDelta(203)), frame(mcpCall(1, "call-1", "echo 1")));
     expect((await readSse(resp)).usage?.prompt_tokens).toBe(141519);
-    const resumed = __test.resumeRun(run, [{ toolCallId: "call-1", content: "one" }], "", true) as Response;
+    const resumed = __test.resumeRun(run, [{ toolCallId: "call-1", content: "one" }], "", true);
     fb.feed(frame(textDelta("done")), frame(tokenDelta(4)));
     fb.close(0);
-    const s = await readSse(resumed);
+    const s = await readSse(await resumed!);
     expect(s.usage).toEqual({ prompt_tokens: Math.ceil((400 + "one".length) / 4), completion_tokens: 4,
       total_tokens: Math.ceil((400 + "one".length) / 4) + 4, helm_estimated: true });
   });
