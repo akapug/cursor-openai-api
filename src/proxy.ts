@@ -280,6 +280,14 @@ interface Run {
   conversation?: ConversationStamp;
   /** Output tokens Cursor reported while no client was attached. */
   heldOutputTokens: number;
+  /**
+   * The Connect error Cursor ended this run with, once one arrived. The
+   * response it lands in ends with an ERROR the client retries, never with
+   * the error as reply text (see `fail`).
+   */
+  failure: Error | null;
+  /** Set while a resumed run waits for its first frame; called once it comes. */
+  opening: (() => void) | null;
 }
 
 /** Paused runs by the client-facing id of every tool call they await. */
@@ -304,6 +312,12 @@ const limits = {
    * HTTP idle timeout turns the turn into "unexpected EOF".
    */
   stallMs: 90_000,
+  /**
+   * How long a request waits for the run's first frame before it commits to
+   * a 200: a fresh run (peekFirstFrame) and a resumed one (awaitFirstFrame)
+   * alike. A refusal inside the wait is a real 429.
+   */
+  firstFrameMs: 15_000,
 };
 
 // --- H2 Bridge IPC ---
@@ -831,9 +845,19 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 // cursor seat, 2026-09-16). The fresh-request path now PEEKS at the first
 // frame before committing to an SSE 200; a refusal there becomes a real 429
 // with Retry-After, which CLIProxyAPI cools on and helm surfaces as
-// PROXY-COOLDOWN. A refusal mid-stream, after content, still lands as text:
-// the status line is already gone by then.
-const PEEK_FIRST_FRAME_MS = 15_000;
+// PROXY-COOLDOWN.
+//
+// helm patch (2026-09-26): THE RESUME PATH WAITS FOR ITS FIRST FRAME TOO, AND
+// NO CONNECT ERROR IS EVER REPLY TEXT. MEASURED on the cursor seat: the
+// request carrying the owner's tool results resumed a paused run, which
+// answered 200 at once, so Cursor's `unavailable` reached Claude Code as the
+// reply "[Error: Connect error unavailable: Error]" and the turn ended there.
+// A resumed run now answers only after its first frame past heartbeats
+// (awaitFirstFrame), and a refusal there is the same 429. A Connect error that
+// arrives after the status line is gone ends the stream with a bare JSON
+// error line and no finish chunk (see `fail`), which CLIProxyAPI's
+// OpenAI-compatible reader turns into an Anthropic `event: error`; the
+// refusal codes carry overloaded_error there, a type Claude Code retries.
 const CONNECT_REFUSAL_CODES = new Set(["resource_exhausted", "unavailable"]);
 
 function connectRefusal(err: Error): { code: string; message: string } | null {
@@ -841,6 +865,48 @@ function connectRefusal(err: Error): { code: string; message: string } | null {
   if (!m) return null;
   const code = m[1]!;
   return CONNECT_REFUSAL_CODES.has(code) ? { code, message: m[2]! } : null;
+}
+
+/** A refusal answered before any byte of the response: 429 with Retry-After. */
+function refusalResponse(refusal: { code: string; message: string }): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: `Connect error ${refusal.code}: ${refusal.message}`,
+        type: "rate_limit_error",
+        code: refusal.code,
+      },
+    }),
+    { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "60" } },
+  );
+}
+
+/**
+ * The error a Connect failure ends a response with once its status line is
+ * gone. overloaded_error for the refusal codes: CLIProxyAPI keeps the type
+ * when it turns this into an Anthropic `event: error`, and Claude Code retries
+ * a streamed error whose body says overloaded_error. Any other code is an
+ * api_error: the turn ends as an API error, never as words the model said.
+ */
+function failureBody(err: Error) {
+  const refusal = connectRefusal(err);
+  return {
+    error: {
+      type: refusal ? "overloaded_error" : "api_error",
+      code: refusal?.code ?? "connect_error",
+      message: err.message,
+    },
+  };
+}
+
+/** A Connect failure answered before the status line: a real HTTP error. */
+function failureResponse(err: Error): Response {
+  const refusal = connectRefusal(err);
+  if (refusal) return refusalResponse(refusal);
+  return new Response(JSON.stringify(failureBody(err)), {
+    status: 502,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 type FirstFramePeek = {
@@ -1276,6 +1342,8 @@ interface Sink {
   toolCall(exec: PendingExec): void;
   /** Ends the client response; `usage` rides the terminal chunk when given. */
   finish(reason: "stop" | "tool_calls", usage: Usage | null): void;
+  /** Ends the client response with Cursor's Connect error (see `fail`). */
+  fail(err: Error): void;
   /** Characters written to this response, for the usage estimate. */
   outChars: number;
   /** Output tokens Cursor reported during this response. */
@@ -1294,21 +1362,12 @@ async function startRun(
   const heartbeatTimer = setInterval(() => {
     bridge.write(makeHeartbeatBytes());
   }, 5_000);
-  const peeked = await peekFirstFrame(bridge, PEEK_FIRST_FRAME_MS);
+  const peeked = await peekFirstFrame(bridge, limits.firstFrameMs);
   if (peeked.refusal) {
     clearInterval(heartbeatTimer);
     bridge.end();
     console.error(`[bridge] upstream refusal on first frame: ${peeked.refusal.code} -> 429`);
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: `Connect error ${peeked.refusal.code}: ${peeked.refusal.message}`,
-          type: "rate_limit_error",
-          code: peeked.refusal.code,
-        },
-      }),
-      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "60" } },
-    );
+    return refusalResponse(peeked.refusal);
   }
   const run: Run = {
     id: ++runSerial,
@@ -1330,6 +1389,8 @@ async function startRun(
     contextTokens: 0,
     heldOutputTokens: 0,
     conversation: payload.conversation,
+    failure: null,
+    opening: null,
   };
   trace(`run ${run.id} started (${modelId})`);
   return respond(run, stream, () => listen(run, peeked));
@@ -1358,7 +1419,7 @@ function feed(run: Run, chunk: Buffer): void {
       const endError = parseConnectEndStream(messageBytes);
       if (endError) {
         console.error(`[bridge] run ${run.id}: ${endError.message}`);
-        emitText(run, `\n[Error: ${endError.message}]`, false);
+        run.failure ??= endError;
       }
       continue;
     }
@@ -1383,10 +1444,33 @@ function feed(run: Run, chunk: Buffer): void {
         err instanceof Error ? err.message : String(err));
     }
   }
+  // A resumed run waiting for its first frame: this chunk decides its status.
+  if (run.opening) {
+    if (progressed) run.opening();
+    return;
+  }
+  if (run.failure && run.sink) {
+    fail(run);
+    return;
+  }
   // Execs that arrive in one chunk are one batch: pause once, after all of
   // them are on the wire, so parallel tool calls reach the client together.
   if (run.pauseAfterChunk) pause(run);
   if (progressed || !run.sink) armStall(run);
+}
+
+/**
+ * End the attached response with Cursor's Connect error, then the run. The
+ * client reads an error it can retry, never a finished turn whose last words
+ * are the error.
+ */
+function fail(run: Run): void {
+  const sink = run.sink!;
+  run.sink = null;
+  run.pauseAfterChunk = false;
+  armStall(run);
+  sink.fail(run.failure!);
+  endRun(run, `Cursor ended it: ${run.failure!.message}`);
 }
 
 /** (Re)start the silence watchdog while a client waits on this run; clear it otherwise. */
@@ -1443,6 +1527,10 @@ function onRunClosed(run: Run, code: number): void {
   forget(run);
   armStall(run);
   trace(`run ${run.id} closed (code ${code})`);
+  if (run.opening) {
+    run.opening();
+    return;
+  }
   if (run.pauseAfterChunk) {
     pause(run);
     return;
@@ -1586,7 +1674,31 @@ function resumeRun(
   }
   run.awaiting = [];
   trace(`run ${run.id} resumed`);
-  return respond(run, stream, () => {});
+  // Something arrived while no client listened: answer from it at once.
+  if (run.held.length || run.queued.length || run.failure) return respond(run, stream, () => {});
+  return awaitFirstFrame(run, limits.firstFrameMs).then(() => {
+    const refusal = run.failure ? connectRefusal(run.failure) : null;
+    if (!refusal) return respond(run, stream, () => {});
+    console.error(`[bridge] run ${run.id}: upstream refusal on the resumed run's first frame: ${refusal.code} -> 429`);
+    endRun(run, "Cursor refused the resumed run");
+    return refusalResponse(refusal);
+  });
+}
+
+/**
+ * Resolve once the resumed run's first frame past heartbeats arrives (feed),
+ * the run closes (onRunClosed), or the wait runs out. Until then nothing is
+ * attached: what arrives is held, and a refusal can still be a 429.
+ */
+function awaitFirstFrame(run: Run, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => run.opening?.(), timeoutMs);
+    run.opening = () => {
+      clearTimeout(timer);
+      run.opening = null;
+      resolve();
+    };
+  });
 }
 
 /**
@@ -1599,6 +1711,10 @@ function attach(run: Run, sink: Sink): void {
   sink.outputTokens += run.heldOutputTokens;
   run.heldOutputTokens = 0;
   for (const h of run.held.splice(0)) sink.text(h.text, h.thinking);
+  if (run.failure) {
+    fail(run);
+    return;
+  }
   const queued = run.queued.splice(0);
   for (const exec of queued) {
     run.awaiting.push(exec);
@@ -1735,6 +1851,20 @@ function sseResponse(run: Run, then: () => void): Response {
             controller.close();
           } catch { /* already closed by the runtime — not an error */ }
         },
+        fail(err) {
+          // A BARE JSON LINE, NOT `data:`, AND NO FINISH CHUNK OR [DONE].
+          // OpenAI's SSE has no error event; CLIProxyAPI's OpenAI-compatible
+          // reader treats a line that starts with "{" as a stream error and
+          // hands its body to the Claude handler, which writes it as an
+          // Anthropic `event: error` with the type it names. A `data:` error
+          // chunk would be translated as an empty delta and dropped.
+          safeEnqueue(`${JSON.stringify(failureBody(err))}\n\n`);
+          if (closed) return;
+          closed = true;
+          try {
+            controller.close();
+          } catch { /* already closed by the runtime — not an error */ }
+        },
       };
       mine = sink;
       attach(run, sink);
@@ -1797,6 +1927,10 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
         }),
         { headers: { "Content-Type": "application/json" } },
       ));
+    },
+    // nothing is sent before the answer is whole, so an error keeps its status
+    fail(err) {
+      resolve(failureResponse(err));
     },
   };
   attach(run, sink);
