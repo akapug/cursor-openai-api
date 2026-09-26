@@ -37,7 +37,7 @@ describe("first-frame peek", () => {
     expect(r.refusal?.code).toBe("resource_exhausted");
     expect(r.buf.length).toBe(5 + body.length);
   });
-  test("a non-refusal end-stream error stays text (no 429)", async () => {
+  test("a non-refusal end-stream error is not a refusal (no 429; the run's response ends with it as an error)", async () => {
     const f = fakeBridge();
     const p = __test.peekFirstFrame(f.bridge as never, 1000);
     f.feed(frame(END, new TextEncoder().encode(JSON.stringify({ error: { code: "failed_precondition", message: "x" } }))));
