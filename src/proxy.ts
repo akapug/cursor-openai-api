@@ -1170,8 +1170,9 @@ function handleExecMessage(
 
   // --- Reject native Cursor tools ---
   // The model tries these first. We must respond with rejection/error
-  // so it falls back to our MCP tools (registered via RequestContext).
-  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
+  // so it falls back to our MCP tools (registered via RequestContext), and
+  // the rejection names the route there (rejectReason).
+  const REJECT_REASON = rejectReason(execCase, mcpTools);
 
   if (execCase === "readArgs") {
     const args = execMsg.message.value;
@@ -1288,6 +1289,41 @@ function handleExecMessage(
 
   // Unknown exec type — log and ignore
   console.error(`[proxy] unhandled exec: ${execCase ?? `unknown(${unknownFields(execMsg)})`}`);
+}
+
+/**
+ * helm patch (2026-09-26): A REFUSED CURSOR TOOL NAMES THE ROUTE TO THE
+ * CALLER'S TOOL. MEASURED on the cursor seat: grok-4.7-high read "Tool not
+ * available in this environment. Use the MCP tools provided instead." as the
+ * end of the road and ended turns saying every command channel was
+ * unavailable, although the same session had reached the caller's Bash
+ * through CallDynamicTool before. The caller's tools reach the model as MCP
+ * server MCP_PROVIDER, called through Cursor's CallDynamicTool (namespace =
+ * the server, toolName = the tool), with GetDynamicTools for the schema. Each
+ * refusal names the caller's tool that does the refused tool's job (first
+ * of its preferences that the request registered), or the route alone when
+ * none is registered.
+ */
+const NATIVE_TOOL_EQUIVALENT: Record<string, string[]> = {
+  shellArgs: ["Bash"],
+  shellStreamArgs: ["Bash"],
+  backgroundShellSpawnArgs: ["Bash"],
+  writeShellStdinArgs: ["Bash"],
+  readArgs: ["Read", "Bash"],
+  lsArgs: ["Bash", "Glob"],
+  grepArgs: ["Grep", "Bash"],
+  writeArgs: ["Write", "Bash"],
+  deleteArgs: ["Bash"],
+  fetchArgs: ["WebFetch", "Bash"],
+};
+
+function rejectReason(execCase: string | undefined, mcpTools: McpToolDefinition[]): string {
+  const registered = new Set(mcpTools.map((t) => t.toolName || t.name));
+  const tool = (NATIVE_TOOL_EQUIVALENT[execCase ?? ""] ?? []).find((name) => registered.has(name));
+  const route = tool
+    ? `call the MCP tool "${tool}" on server "${MCP_PROVIDER}" with CallDynamicTool (namespace "${MCP_PROVIDER}", toolName "${tool}"); GetDynamicTools gives its schema`
+    : `call a tool on MCP server "${MCP_PROVIDER}" with CallDynamicTool (namespace "${MCP_PROVIDER}"); GetDynamicTools lists them with their schemas`;
+  return `Cursor's own tool is refused in this environment, so do not stop here: ${route}.`;
 }
 
 /**
