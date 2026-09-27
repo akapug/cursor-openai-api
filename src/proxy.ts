@@ -577,14 +577,17 @@ async function handleChatCompletion(
   }
 
   // A request whose trailing tool results answer a paused run resumes it,
-  // unless the conversation was rewritten under it (takePausedRun).
-  const promptTokens = requestTokens(body.messages, tools);
+  // unless the conversation was rewritten under it (takePausedRun). That path
+  // sends results directly and synthesizes neither stateless prompt.
   const paused = takePausedRun(body.messages);
   if (paused) {
+    const promptTokens = requestTokens(body.messages, tools, false);
     const resumed = resumeRun(paused, toolResults, tailText, body.stream !== false, promptTokens);
     if (resumed) return resumed;
     console.error(`[bridge] run ${paused.id} ended before its tool results came back; answering statelessly`);
   }
+
+  const promptTokens = requestTokens(body.messages, tools, true);
 
   // helm patch (2026-09-16): TOOL RESULTS WERE SILENTLY DROPPED ON THE
   // STATELESS PATH, so the model saw its own tool call with no output and
@@ -649,6 +652,8 @@ function contentToText(content: unknown): string {
   return String(content);
 }
 
+const DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant.";
+
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   const systemParts = messages
     .filter((m) => m.role === "system")
@@ -661,7 +666,7 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     if (messages[i]!.role === "user") tail.unshift(contentToText(messages[i]!.content));
   }
   return {
-    systemPrompt: systemParts.length > 0 ? systemParts.join("\n") : "You are a helpful assistant.",
+    systemPrompt: systemParts.length > 0 ? systemParts.join("\n") : DEFAULT_SYSTEM_PROMPT,
     tailText: tail.filter(Boolean).join("\n\n"),
     toolResults,
   };
@@ -763,6 +768,8 @@ function toHistory(messages: OpenAIMessage[]): { history: HistoryMessage[]; user
 /** The MCP provider every caller tool is registered under. */
 const MCP_PROVIDER = "opencode";
 
+const EMPTY_TOOL_SCHEMA: JsonValue = { type: "object", properties: {}, required: [] };
+
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   return tools.map((t) => {
@@ -770,7 +777,7 @@ function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
     const jsonSchema: JsonValue =
       fn.parameters && typeof fn.parameters === "object"
         ? (fn.parameters as JsonValue)
-        : { type: "object", properties: {}, required: [] };
+        : EMPTY_TOOL_SCHEMA;
     const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
     return create(McpToolDefinitionSchema, {
       name: fn.name,
@@ -1885,20 +1892,42 @@ const utf8Bytes = (text: string): number => Buffer.byteLength(text, "utf8");
 /**
  * The size of a request in tokens, estimated: the UTF-8 bytes of every
  * message's text (system prompt and tool results included), every tool
- * call's name and arguments, and every tool's name, description and
- * parameter schema, over BYTES_PER_TOKEN. It counts the text the client
- * sent, never the JSON the bridge wraps it in for Cursor.
+ * call/result id, call name and arguments, and every tool's name, description
+ * and forwarded parameter schema, over BYTES_PER_TOKEN. The default system
+ * and continuation prompts count when the bridge synthesizes them. It counts
+ * payload fields, never the JSON the bridge wraps them in for Cursor.
  */
-function requestTokens(messages: OpenAIMessage[], tools: OpenAIToolDef[]): number {
+function requestTokens(
+  messages: OpenAIMessage[],
+  tools: OpenAIToolDef[],
+  stateless = true,
+): number {
   let bytes = 0;
   for (const m of messages) {
     bytes += utf8Bytes(contentToText(m.content));
+    if (m.role === "tool") bytes += utf8Bytes(m.tool_call_id ?? "");
     for (const call of m.tool_calls ?? []) {
-      bytes += utf8Bytes(call.function.name) + utf8Bytes(call.function.arguments ?? "");
+      bytes += utf8Bytes(call.id) + utf8Bytes(call.function.name)
+        + utf8Bytes(call.function.arguments ?? "");
     }
   }
   for (const { function: fn } of tools) {
-    bytes += utf8Bytes(fn.name) + utf8Bytes(fn.description ?? "") + utf8Bytes(JSON.stringify(fn.parameters ?? {}));
+    const schema = fn.parameters && typeof fn.parameters === "object"
+      ? fn.parameters
+      : EMPTY_TOOL_SCHEMA;
+    bytes += utf8Bytes(fn.name) + utf8Bytes(fn.description ?? "")
+      + utf8Bytes(JSON.stringify(schema));
+  }
+  // The stateless path adds these prompts. A paused-run resume sends tool
+  // results directly, so neither exists on that path.
+  if (stateless) {
+    if (!messages.some((m) => m.role === "system")) {
+      bytes += utf8Bytes(DEFAULT_SYSTEM_PROMPT);
+    }
+    const last = messages.filter((m) => m.role !== "system").at(-1);
+    if (!last || last.role !== "user" || !contentToText(last.content).trim()) {
+      bytes += utf8Bytes(CONTINUE_PROMPT);
+    }
   }
   return Math.ceil(bytes / BYTES_PER_TOKEN);
 }
@@ -2019,7 +2048,8 @@ function sseResponse(run: Run, then: () => void): Response {
         },
         toolCall(exec) {
           thinking = false;
-          sink.outBytes += utf8Bytes(exec.toolName) + utf8Bytes(exec.decodedArgs);
+          sink.outBytes += utf8Bytes(exec.toolCallId) + utf8Bytes(exec.toolName)
+            + utf8Bytes(exec.decodedArgs);
           send(chunk({
             tool_calls: [{
               index: toolIndex++,
@@ -2093,7 +2123,8 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
       else content += text;
     },
     toolCall(exec) {
-      sink.outBytes += utf8Bytes(exec.toolName) + utf8Bytes(exec.decodedArgs);
+      sink.outBytes += utf8Bytes(exec.toolCallId) + utf8Bytes(exec.toolName)
+        + utf8Bytes(exec.decodedArgs);
       toolCalls.push({
         id: exec.toolCallId,
         type: "function",

@@ -46,15 +46,16 @@ const TOOLS: Tool[] = [{
 }];
 
 /** A request's estimate, as handleChatCompletion hands it to the run. */
-function estimate(messages: Msg[], tools: Tool[] = TOOLS): number {
-  return __test.requestTokens(messages as never, tools as never);
+function estimate(messages: Msg[], tools: Tool[] = TOOLS, stateless = true): number {
+  return __test.requestTokens(messages as never, tools as never, stateless);
 }
 
 const bytes = (s: string) => Buffer.byteLength(s, "utf8");
 
-/** The UTF-8 bytes a client received: text, reasoning, and each tool call's name and arguments. */
-function carried(s: { content: string; reasoning: string; toolCalls: Array<{ name: string; arguments: string }> }): number {
-  return bytes(s.content) + bytes(s.reasoning) + s.toolCalls.reduce((n, c) => n + bytes(c.name) + bytes(c.arguments), 0);
+/** The UTF-8 bytes a client received: text, reasoning, and each tool call's id, name and arguments. */
+function carried(s: { content: string; reasoning: string; toolCalls: Array<{ id: string; name: string; arguments: string }> }): number {
+  return bytes(s.content) + bytes(s.reasoning)
+    + s.toolCalls.reduce((n, c) => n + bytes(c.id) + bytes(c.name) + bytes(c.arguments), 0);
 }
 
 /** A fresh conversation after /clear: the system prompt and one short user message. */
@@ -74,7 +75,7 @@ function started(messages: Msg[], stream = true) {
 async function jsonBody(resp: Response | Promise<Response>) {
   return await (await resp).json() as {
     usage?: Record<string, unknown>;
-    choices: Array<{ finish_reason: string; message: { content: string; reasoning_content?: string; tool_calls?: Array<{ function: { name: string; arguments: string } }> } }>;
+    choices: Array<{ finish_reason: string; message: { content: string; reasoning_content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
   };
 }
 
@@ -90,13 +91,22 @@ describe("the request estimate", () => {
       { role: "user", content: "漢字" },                                                 // 6: three bytes a character
     ];
     const tools: Tool[] = [{ type: "function", function: { name: "Bash", description: "Run.", parameters: { type: "object" } } }];
-    // tool: "Bash" 4 + "Run." 4 + '{"type":"object"}' 17
-    expect(__test.requestTokens(messages as never, tools as never)).toBe(Math.ceil((4 + 8 + 2 + 20 + 5 + 6 + 25) / 4));
-    expect(__test.requestTokens(messages as never, [] as never)).toBe(Math.ceil((4 + 8 + 2 + 20 + 5 + 6) / 4));
+    // call/result ids: 2 + 2; tool: "Bash" 4 + "Run." 4 + '{"type":"object"}' 17
+    expect(__test.requestTokens(messages as never, tools as never)).toBe(Math.ceil((4 + 8 + 2 + 22 + 7 + 6 + 25) / 4));
+    expect(__test.requestTokens(messages as never, [] as never)).toBe(Math.ceil((4 + 8 + 2 + 22 + 7 + 6) / 4));
   });
 
-  test("a tool with no description or parameters counts its name and an empty schema", () => {
-    expect(__test.requestTokens([] as never, [{ type: "function", function: { name: "Ping" } }] as never)).toBe(Math.ceil((4 + 2) / 4));
+  test("a tool with no description or parameters counts the schema actually forwarded", () => {
+    const messages: Msg[] = [{ role: "system", content: "s" }, { role: "user", content: "u" }];
+    const schema = JSON.stringify({ type: "object", properties: {}, required: [] });
+    expect(__test.requestTokens(messages as never, [{ type: "function", function: { name: "Ping" } }] as never))
+      .toBe(Math.ceil((2 + 4 + bytes(schema)) / 4));
+  });
+
+  test("a text-empty user request counts the prompts the bridge synthesizes", () => {
+    const messages: Msg[] = [{ role: "user", content: "" }];
+    expect(__test.requestTokens(messages as never, [] as never))
+      .toBe(Math.ceil((bytes("You are a helpful assistant.") + bytes("Continue from where you left off, using the tool results above.")) / 4));
   });
 });
 
@@ -174,15 +184,18 @@ describe("usage, streamed", () => {
       { role: "assistant", content: null, tool_calls: [{ id: "call-1", type: "function", function: { name: "Bash", arguments: "{\"command\":\"echo 1\"}" } }] },
       { role: "tool", tool_call_id: "call-1", content: "r".repeat(4000) },
     ];
-    const resumed = __test.resumeRun(run as never, [{ toolCallId: "call-1", content: "r".repeat(4000) }], "", true, estimate(second));
+    const resumedTokens = estimate(second, TOOLS, false);
+    const resumed = __test.resumeRun(run as never, [{ toolCallId: "call-1", content: "r".repeat(4000) }], "", true, resumedTokens);
     // Cursor's measured one-time rise after the first tool round trip
     fb.feed(frame(checkpoint(63453)), frame(textDelta("done")));
     fb.close(0);
     const two = await readSse(await resumed!);
-    expect(two.usage?.prompt_tokens).toBe(estimate(second));
-    // it grew by the call and its result, 4,024 bytes, and Cursor's rise of
-    // 47,143 is nowhere in it
-    expect((two.usage!.prompt_tokens as number) - (one.usage!.prompt_tokens as number)).toBe(4024 / 4);
+    expect(two.usage?.prompt_tokens).toBe(resumedTokens);
+    // It grew by the call, both copies of its id, and its result. A paused-run
+    // resume sends those results directly, so no stateless continuation prompt
+    // is counted; Cursor's rise of 47,143 is absent.
+    expect((two.usage!.prompt_tokens as number) - (one.usage!.prompt_tokens as number))
+      .toBe(resumedTokens - estimate(first));
   });
 
   test("a compacted conversation reports its own small size, never the long one's", async () => {
@@ -222,7 +235,7 @@ describe("usage, through the request handler", () => {
     fb.close(0);
     const s = await readSse(await pending);
     expect(s.content).toBe("printed 1");
-    expect(s.usage?.prompt_tokens).toBe(estimate(body.messages));
+    expect(s.usage?.prompt_tokens).toBe(estimate(body.messages, TOOLS, false));
     expect(s.usage?.prompt_tokens).toBeGreaterThan(estimate(first));
   });
 });
@@ -245,8 +258,8 @@ describe("usage, non-streamed", () => {
     const { fb, resp } = started(messages, false);
     fb.feed(frame(mcpCall(1, "call-1", "echo 1")));
     const body = await jsonBody(resp);
-    const call = body.choices[0]!.message.tool_calls![0]!.function;
+    const call = body.choices[0]!.message.tool_calls![0]!;
     expect(body.choices[0]!.finish_reason).toBe("tool_calls");
-    expect(body.usage?.completion_tokens).toBe(Math.ceil((bytes(call.name) + bytes(call.arguments)) / 4));
+    expect(body.usage?.completion_tokens).toBe(Math.ceil((bytes(call.id) + bytes(call.function.name) + bytes(call.function.arguments)) / 4));
   });
 });
