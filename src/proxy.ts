@@ -250,8 +250,20 @@ interface Run {
   closed: boolean;
   /** Ends a paused run nobody came back for. */
   expiry: NodeJS.Timeout | null;
-  /** Ends an attached run Cursor has gone silent on. */
+  /** Ends an attached run that is stuck (see `stallDue`). */
   stall: NodeJS.Timeout | null;
+  /**
+   * Cursor's own call ids of the tool calls it opened (toolCallStarted) and
+   * has not completed (toolCallCompleted). Non-empty means Cursor waits on
+   * the bridge's answer to an exec, so its heartbeats are no progress.
+   */
+  openTools: Set<string>;
+  /** When the last byte from Cursor arrived, a heartbeat included (performance.now ms). */
+  lastByteAt: number;
+  /** When the last frame that is not a heartbeat arrived (ms). */
+  lastProgressAt: number;
+  /** When the attached client last got a byte of its response (ms). */
+  lastSentAt: number;
   /**
    * The conversation's size in the model's window, as Cursor reported it
    * during the response now attached (0 = not yet). Reset when a paused run
@@ -277,6 +289,44 @@ interface Run {
 const pausedRuns = new Map<string, Run>();
 let runSerial = 0;
 
+/**
+ * helm patch (2026-09-27): THE CLIENT'S IDLE TIMEOUT. Bun.serve closes a
+ * connection that has carried no byte for this long, and 255 s is the most it
+ * allows. MEASURED 2026-09-25: a turn stuck on an exec answer that never
+ * reached Cursor was cut at 254 s as "unexpected EOF". Every watchdog window
+ * ends a run before this does, so the client is told why in words.
+ */
+const IDLE_TIMEOUT_S = 255;
+/** The last moment a watchdog may still speak: 15 s before the idle timeout. */
+const WINDOW_CEILING_MS = (IDLE_TIMEOUT_S - 15) * 1000;
+/** Cursor heartbeats every 10 s; a window under three periods misreads a live stream. */
+const STALL_FLOOR_MS = 30_000;
+const STALL_DEFAULT_MS = 90_000;
+
+/**
+ * The stall window from CURSOR_BRIDGE_STALL_MS: a whole number of
+ * milliseconds, held between STALL_FLOOR_MS and WINDOW_CEILING_MS. Unset or
+ * empty is the default; anything else that is not a whole number is the
+ * default too, and says so on stderr, so a typo never silently moves it.
+ */
+function stallWindow(
+  raw: string | undefined,
+  warn: (message: string) => void = (m) => console.error(m),
+): number {
+  const text = (raw ?? "").trim();
+  if (!text) return STALL_DEFAULT_MS;
+  const ms = /^\d+$/.test(text) ? Number(text) : NaN;
+  if (!Number.isSafeInteger(ms)) {
+    warn(`[bridge] CURSOR_BRIDGE_STALL_MS=${JSON.stringify(raw)} is not a whole number of milliseconds; the stall window is the ${STALL_DEFAULT_MS} ms default`);
+    return STALL_DEFAULT_MS;
+  }
+  const held = Math.min(Math.max(ms, STALL_FLOOR_MS), WINDOW_CEILING_MS);
+  if (held !== ms) {
+    warn(`[bridge] CURSOR_BRIDGE_STALL_MS=${ms} is outside ${STALL_FLOOR_MS}..${WINDOW_CEILING_MS} ms (three of Cursor's 10 s heartbeat periods, and 15 s below the client's idle timeout (${IDLE_TIMEOUT_S} s)); the stall window is ${held} ms`);
+  }
+  return held;
+}
+
 /** Run lifetimes, read at call time (tests shorten them). */
 const limits = {
   /**
@@ -286,15 +336,21 @@ const limits = {
    */
   pausedTtlMs: 15 * 60_000,
   /**
-   * helm patch (2026-09-25): while a client is attached and waiting, a live
-   * run makes PROGRESS — deltas, checkpoints, execs. Heartbeats do not count:
-   * MEASURED, Cursor sends an interaction heartbeat every 10 s exactly while
-   * it waits on an exec answer the bridge never sends, so a stuck run is
-   * never silent. This long with nothing but heartbeats means the run is
-   * stuck, and the client is told so in words instead of hanging until the
-   * HTTP idle timeout turns the turn into "unexpected EOF".
+   * helm patch (2026-09-25, 2026-09-27): while a client is attached, a run
+   * that sends nothing for this long, not even a heartbeat, is a dead stream;
+   * and a run with a tool call open that sends only heartbeats for this long
+   * is stuck: MEASURED, Cursor heartbeats every 10 s exactly while it waits
+   * on an exec answer that never reached it. Heartbeats with NO tool call
+   * open are the model working (it can think for minutes), so they keep the
+   * run alive (see `stallDue`). CURSOR_BRIDGE_STALL_MS moves it.
    */
-  stallMs: 90_000,
+  stallMs: stallWindow(process.env.CURSOR_BRIDGE_STALL_MS),
+  /**
+   * helm patch (2026-09-27): the longest the attached client may get no byte
+   * of its response. Past it Bun's idle timeout closes the connection as
+   * "unexpected EOF", so the bridge ends the run first and says why.
+   */
+  idleGuardMs: WINDOW_CEILING_MS,
   /**
    * How long a request waits for the run's first frame before it commits to
    * a 200: a fresh run (peekFirstFrame) and a resumed one (awaitFirstFrame)
@@ -417,7 +473,7 @@ export async function startProxy(
     // machine could spend it. The only caller is the seat's local proxy.
     hostname: "127.0.0.1",
     port,
-    idleTimeout: 255, // max — Cursor responses can take 30s+
+    idleTimeout: IDLE_TIMEOUT_S, // max — Cursor responses can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
 
@@ -1400,6 +1456,10 @@ async function startRun(
     closed: false,
     expiry: null,
     stall: null,
+    openTools: new Set(),
+    lastByteAt: 0,
+    lastProgressAt: 0,
+    lastSentAt: 0,
     contextTokens: 0,
     heldOutputTokens: 0,
     conversation: payload.conversation,
@@ -1420,6 +1480,7 @@ function listen(run: Run, peeked: FirstFramePeek): void {
 
 function feed(run: Run, chunk: Buffer): void {
   let progressed = false;
+  run.lastByteAt = performance.now();
   run.pending = Buffer.concat([run.pending, chunk]);
   while (run.pending.length >= 5) {
     const flags = run.pending[0]!;
@@ -1442,6 +1503,7 @@ function feed(run: Run, chunk: Buffer): void {
       if (!(msg.message.case === "interactionUpdate" && msg.message.value.message.case === "heartbeat")) {
         progressed = true;
       }
+      trackToolCalls(run, msg);
       processServerMessage(
         msg,
         run.blobStore,
@@ -1458,6 +1520,7 @@ function feed(run: Run, chunk: Buffer): void {
         err instanceof Error ? err.message : String(err));
     }
   }
+  if (progressed) run.lastProgressAt = performance.now();
   // A resumed run waiting for its first frame: this chunk decides its status.
   if (run.opening) {
     if (progressed) run.opening();
@@ -1470,7 +1533,23 @@ function feed(run: Run, chunk: Buffer): void {
   // Execs that arrive in one chunk are one batch: pause once, after all of
   // them are on the wire, so parallel tool calls reach the client together.
   if (run.pauseAfterChunk) pause(run);
-  if (progressed || !run.sink) armStall(run);
+  armStall(run);
+}
+
+/**
+ * helm patch (2026-09-27): WHETHER CURSOR WAITS ON THE BRIDGE IS CURSOR'S OWN
+ * BOOKKEEPING. MEASURED in the bridge's trace of 2026-09-25: each of the 38
+ * tool calls opened with toolCallStarted before its exec, and each exec the
+ * bridge answered was followed by toolCallCompleted within 100 ms. The one
+ * that stuck (a streamed shell refused on the wrong channel) got no
+ * toolCallCompleted, and Cursor sent only heartbeats for 252 s. The bridge
+ * cannot tell a wrong answer from a right one, so the open call is the sign.
+ */
+function trackToolCalls(run: Run, msg: AgentServerMessage): void {
+  if (msg.message.case !== "interactionUpdate") return;
+  const update = msg.message.value.message;
+  if (update.case === "toolCallStarted") run.openTools.add(update.value.callId);
+  else if (update.case === "toolCallCompleted") run.openTools.delete(update.value.callId);
 }
 
 /**
@@ -1487,15 +1566,47 @@ function fail(run: Run): void {
   endRun(run, `Cursor ended it: ${run.failure!.message}`);
 }
 
-/** (Re)start the silence watchdog while a client waits on this run; clear it otherwise. */
+/**
+ * When the attached run is stuck, and why: the earliest of
+ * - a dead stream: no byte from Cursor, not even a heartbeat, for stallMs;
+ * - Cursor waiting on the bridge: a tool call open and only heartbeats for
+ *   stallMs (the 09-25 stall);
+ * - the client about to time out: no byte of its response for idleGuardMs,
+ *   whatever Cursor is doing, since Bun would close the connection next.
+ * A model thinking with no tool call open sends heartbeats, and is none of
+ * these until the last.
+ */
+function stallDue(run: Run): { at: number; why: string } {
+  const s = (ms: number) => ms / 1000;
+  const due = [
+    { at: run.lastByteAt + limits.stallMs,
+      why: `Cursor sent nothing for ${s(limits.stallMs)} s, not even a heartbeat` },
+    { at: run.lastSentAt + limits.idleGuardMs,
+      why: `the client got nothing for ${s(limits.idleGuardMs)} s, and its idle timeout is ${IDLE_TIMEOUT_S} s` },
+  ];
+  if (run.openTools.size) {
+    due.push({ at: run.lastProgressAt + limits.stallMs,
+      why: `Cursor made no progress for ${s(limits.stallMs)} s with a tool call open (heartbeats only)` });
+  }
+  return due.reduce((a, b) => (b.at < a.at ? b : a));
+}
+
+/** (Re)start the watchdog while a client waits on this run; clear it otherwise. */
 function armStall(run: Run): void {
   if (run.stall) clearTimeout(run.stall);
   run.stall = null;
   if (!run.sink || run.closed) return;
   run.stall = setTimeout(() => {
-    emitText(run, `\n[Error: Cursor made no progress for ${limits.stallMs / 1000} s (heartbeats only); the bridge ended this run]`, false);
-    endRun(run, "stalled");
-  }, limits.stallMs);
+    run.stall = null;
+    if (!run.sink || run.closed) return;
+    const due = stallDue(run);
+    if (due.at > performance.now()) {
+      armStall(run);
+      return;
+    }
+    emitText(run, `\n[Error: ${due.why}; the bridge ended this run]`, false);
+    endRun(run, `stalled: ${due.why}`);
+  }, Math.max(0, stallDue(run).at - performance.now()));
 }
 
 function countTokens(run: Run, counts: TokenCounts): void {
@@ -1724,6 +1835,9 @@ function awaitFirstFrame(run: Run, timeoutMs: number): Promise<void> {
  */
 function attach(run: Run, sink: Sink): void {
   run.sink = sink;
+  // A new response starts every watchdog clock: what came before it was
+  // another response's, or a pause while the client ran a tool.
+  run.lastByteAt = run.lastProgressAt = run.lastSentAt = performance.now();
   sink.outputTokens += run.heldOutputTokens;
   run.heldOutputTokens = 0;
   for (const h of run.held.splice(0)) sink.text(h.text, h.thinking);
@@ -1834,6 +1948,7 @@ function sseResponse(run: Run, then: () => void): Response {
         if (closed) return;
         try {
           controller.enqueue(encoder.encode(text));
+          run.lastSentAt = performance.now();
         } catch (err) {
           // helm patch (2026-09-16, ds4pro review F5): do NOT swallow silently.
           // A closed controller is the ordinary end of a stream; anything else
@@ -1979,4 +2094,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { conversationContext, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
+export const __test = { IDLE_TIMEOUT_S, stallWindow, conversationContext, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
