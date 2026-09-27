@@ -11,13 +11,13 @@
 //    own max_tokens of 256,000. helm read 474.9% of the 192,000 window and
 //    Claude Code's status line read "0% until auto-compact". Five readings
 //    over 256,000 in the 21 hours that build ran (603,845, 367,162, 982,009,
-//    609,634, 911,810), each one a compaction.
+//    609,634, 911,810), each followed by a compaction within four minutes.
 //  - the first response of a fresh conversation reported about 50,500 output
 //    tokens (50,474 to 50,909, ten conversations) for a few hundred visible
 //    tokens, in under 20 s, and the next checkpoint rose about 47,000
-//    (16,310 to 63,453) while the conversation grew 3.9 KB. Claude Code
-//    counts output into its window, so the seat compacted every 8 to 10
-//    minutes.
+//    (16,310 to 63,453) while the conversation grew 3.9 KB. Claude Code adds
+//    output to input when it sizes its window. While it worked, the seat
+//    compacted every 8 to 19 minutes.
 // A response now reports an estimate of what the request carried (its
 // messages and tools, UTF-8 bytes over four) and of what the response carried
 // (text, reasoning and tool calls, the same way). Cursor's counts reach

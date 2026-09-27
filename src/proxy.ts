@@ -265,15 +265,21 @@ interface Run {
   /** When the attached client last got a byte of its response (ms). */
   lastSentAt: number;
   /**
-   * The conversation's size in the model's window, as Cursor reported it
-   * during the response now attached (0 = not yet). Reset when a paused run
-   * resumes: a checkpoint belongs to the response it arrived in, and a
-   * response that gets none reports the conversation's last count (usageOf).
+   * The size of the request now attached, estimated from its messages and
+   * tools (`requestTokens`): set when the run starts and replaced by every
+   * request that resumes it. This is the prompt count a response reports.
+   */
+  promptTokens: number;
+  /**
+   * Cursor's own count of its conversation during the response now attached
+   * (0 = none yet), reset when a paused run resumes. It is traced beside the
+   * usage and never reported: it is not the conversation the client sent
+   * (usageOf).
    */
   contextTokens: number;
   /** The client conversation this run holds; absent = unknown, not vetoed. */
   conversation?: ConversationStamp;
-  /** Output tokens Cursor reported while no client was attached. */
+  /** Output tokens Cursor reported while no client was attached (traced only). */
   heldOutputTokens: number;
   /**
    * The Connect error Cursor ended this run with, once one arrived. The
@@ -572,9 +578,10 @@ async function handleChatCompletion(
 
   // A request whose trailing tool results answer a paused run resumes it,
   // unless the conversation was rewritten under it (takePausedRun).
+  const promptTokens = requestTokens(body.messages, tools);
   const paused = takePausedRun(body.messages);
   if (paused) {
-    const resumed = resumeRun(paused, toolResults, tailText, body.stream !== false);
+    const resumed = resumeRun(paused, toolResults, tailText, body.stream !== false, promptTokens);
     if (resumed) return resumed;
     console.error(`[bridge] run ${paused.id} ended before its tool results came back; answering statelessly`);
   }
@@ -589,7 +596,7 @@ async function handleChatCompletion(
   payload.mcpTools = buildMcpToolDefinitions(tools);
   payload.conversation = conversationStamp(body.messages);
 
-  return startRun(payload, accessToken, modelId, body.stream !== false);
+  return startRun(payload, accessToken, modelId, body.stream !== false, promptTokens);
 }
 
 // --- Message Parsing ---
@@ -1414,19 +1421,21 @@ interface Usage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  /** Whose checkpoint `prompt_tokens` is: this response's, or the conversation's last. */
-  helm_context: "response" | "conversation";
+  /** Both counts are estimates, UTF-8 bytes over four (usageOf). */
+  helm_usage: "estimate";
 }
 
 /** Where a run's output goes while a client request is attached to it. */
 interface Sink {
   text(text: string, thinking: boolean): void;
   toolCall(exec: PendingExec): void;
-  /** Ends the client response; `usage` rides the terminal chunk when given. */
-  finish(reason: "stop" | "tool_calls", usage: Usage | null): void;
+  /** Ends the client response; `usage` rides the terminal chunk. */
+  finish(reason: "stop" | "tool_calls", usage: Usage): void;
   /** Ends the client response with Cursor's Connect error (see `fail`). */
   fail(err: Error): void;
-  /** Output tokens Cursor reported during this response. */
+  /** UTF-8 bytes of the text, reasoning and tool calls this response carried. */
+  outBytes: number;
+  /** Output tokens Cursor reported during this response (traced only). */
   outputTokens: number;
 }
 
@@ -1436,6 +1445,7 @@ async function startRun(
   accessToken: string,
   modelId: string,
   stream: boolean,
+  promptTokens: number,
 ): Promise<Response> {
   const bridge = spawnBridge(accessToken);
   bridge.write(frameConnectMessage(payload.requestBytes));
@@ -1469,6 +1479,7 @@ async function startRun(
     lastByteAt: 0,
     lastProgressAt: 0,
     lastSentAt: 0,
+    promptTokens,
     contextTokens: 0,
     heldOutputTokens: 0,
     conversation: payload.conversation,
@@ -1619,10 +1630,7 @@ function armStall(run: Run): void {
 }
 
 function countTokens(run: Run, counts: TokenCounts): void {
-  if (counts.context) {
-    run.contextTokens = counts.context;
-    rememberContext(run, counts.context);
-  }
+  if (counts.context) run.contextTokens = counts.context;
   if (!counts.output) return;
   if (run.sink) run.sink.outputTokens += counts.output;
   else run.heldOutputTokens += counts.output;
@@ -1755,9 +1763,11 @@ function resumeRun(
   toolResults: ToolResultInfo[],
   userText: string,
   stream: boolean,
+  promptTokens: number,
 ): Response | Promise<Response> | null {
   forget(run);
   if (run.closed) return null;
+  run.promptTokens = promptTokens;   // the request now attached is the whole conversation
   run.contextTokens = 0;   // a checkpoint belongs to the response it arrives in
   const answered = run.awaiting.map((exec) => toolResults.find(
     (r) => clientToolCallId(r.toolCallId) === exec.toolCallId,
@@ -1867,61 +1877,72 @@ function attach(run: Run, sink: Sink): void {
   armStall(run);
 }
 
-/**
- * Cursor's last context count for each client conversation, by the
- * conversation stamp's head (the first user message's digest), newest last.
- * A compaction rewrites the first user message, so a compacted conversation
- * has a new head and never inherits the old one's count. Bounded: the oldest
- * conversation is dropped past CONVERSATIONS_KEPT.
- */
-const conversationContext = new Map<string, number>();
-const CONVERSATIONS_KEPT = 256;
+/** Bytes per token for both usage estimates (usageOf). */
+const BYTES_PER_TOKEN = 4;
 
-function rememberContext(run: Run, tokens: number): void {
-  const head = run.conversation?.head;
-  if (!head) return;
-  conversationContext.delete(head);
-  conversationContext.set(head, tokens);
-  if (conversationContext.size > CONVERSATIONS_KEPT) {
-    conversationContext.delete(conversationContext.keys().next().value!);
+const utf8Bytes = (text: string): number => Buffer.byteLength(text, "utf8");
+
+/**
+ * The size of a request in tokens, estimated: the UTF-8 bytes of every
+ * message's text (system prompt and tool results included), every tool
+ * call's name and arguments, and every tool's name, description and
+ * parameter schema, over BYTES_PER_TOKEN. It counts the text the client
+ * sent, never the JSON the bridge wraps it in for Cursor.
+ */
+function requestTokens(messages: OpenAIMessage[], tools: OpenAIToolDef[]): number {
+  let bytes = 0;
+  for (const m of messages) {
+    bytes += utf8Bytes(contentToText(m.content));
+    for (const call of m.tool_calls ?? []) {
+      bytes += utf8Bytes(call.function.name) + utf8Bytes(call.function.arguments ?? "");
+    }
   }
+  for (const { function: fn } of tools) {
+    bytes += utf8Bytes(fn.name) + utf8Bytes(fn.description ?? "") + utf8Bytes(JSON.stringify(fn.parameters ?? {}));
+  }
+  return Math.ceil(bytes / BYTES_PER_TOKEN);
 }
 
 /**
- * The usage a response reports, which Claude Code's autocompact reads, or
- * null for none.
+ * The usage a response reports. Claude Code reads it as the size of its
+ * conversation: its auto-compact counts input plus output, and helm's
+ * autocompact counts the input.
  *
- * helm patch (2026-09-25): REAL COUNTS WHERE CURSOR SENDS THEM. Every
- * generated chunk is followed by an InteractionUpdate.token_delta, and each
- * checkpoint carries ConversationTokenDetails.used_tokens, the
- * conversation's size in the model's window. A tool-call turn — most turns of
- * a Claude Code seat — used to carry no usage at all (task/2640).
+ * helm patch (2026-09-25): every terminal chunk carries usage. A tool-call
+ * turn, most turns of a Claude Code seat, used to carry none (task/2640).
  *
- * helm patch (2026-09-26): NO ESTIMATE IS EVER USAGE. A response that got no
- * checkpoint reported ceil(promptChars / 4), the UTF-8 bytes of every
- * root-prompt blob over four, which overstates Cursor's count several times
- * over. MEASURED on the cursor seat: two fresh-request responses four minutes
- * apart on the same conversation reported 94,263 (no checkpoint) and 48,828
- * (a checkpoint), the resumed response between them 48,002; an earlier one
- * reported 397,729 where Cursor's own count was 79,652. Claude Code read the
- * guess as the window and compacted on it. A fresh response that pauses on a
- * tool call before Cursor sends any checkpoint is the usual case, since
- * Cursor checkpoints after a tool call completes.
+ * helm patch (2026-09-27): USAGE DESCRIBES THE REQUEST, NEVER CURSOR'S COUNT
+ * (task/3374). The 2026-09-26 patch reported Cursor's checkpoint count
+ * (ConversationTokenDetails.used_tokens) and token_delta output. They count
+ * Cursor's own conversation, which is not the one the client sent. MEASURED
+ * on the cursor seat's transcripts:
+ *  - one conversation, two fresh runs 87 minutes apart, 796 bytes of message
+ *    text between them: 77,400, then 911,810, which is 3.6 times Cursor's own
+ *    max_tokens of 256,000. helm read 474.9% of the 192,000 window. That
+ *    build reported five counts above 256,000 in 21 hours, and a compaction
+ *    followed each one within four minutes.
+ *  - the first response of a fresh conversation: about 50,500 output tokens
+ *    (ten conversations, 50,474 to 50,909) for a few hundred visible tokens
+ *    in under 20 s. The next checkpoint rose about 47,000 (16,310 to 63,453)
+ *    for 3.9 KB of new conversation. While it worked, the seat compacted
+ *    every 8 to 19 minutes.
  *
- * So `prompt_tokens` is this response's own checkpoint, else the last count
- * Cursor sent for the same client conversation (`conversationContext`), and
- * with neither the response carries no usage. Output is what token_delta
- * counted. `helm_context` says whose checkpoint the prompt count is.
+ * So both counts are ESTIMATES, and `helm_usage` says so. `prompt_tokens` is
+ * the attached request's size (`requestTokens`, taken again from every
+ * request that resumes the run, since each one carries the whole
+ * conversation). `completion_tokens` is the UTF-8 bytes of the text,
+ * reasoning and tool calls this response carried, over the same four.
+ * Cursor's counts reach neither; a trace line shows them beside the estimate.
  */
-function usageOf(run: Run, sink: Sink): Usage | null {
-  const carried = run.conversation ? conversationContext.get(run.conversation.head) : undefined;
-  const prompt = run.contextTokens || carried;
-  if (!prompt) return null;
+function usageOf(run: Run, sink: Sink): Usage {
+  const output = Math.ceil(sink.outBytes / BYTES_PER_TOKEN);
+  trace(`run ${run.id} usage prompt=${run.promptTokens} completion=${output} (estimates);`,
+    `Cursor counted context=${run.contextTokens || "none"} output=${sink.outputTokens}`);
   return {
-    prompt_tokens: prompt,
-    completion_tokens: sink.outputTokens,
-    total_tokens: prompt + sink.outputTokens,
-    helm_context: run.contextTokens ? "response" : "conversation",
+    prompt_tokens: run.promptTokens,
+    completion_tokens: output,
+    total_tokens: run.promptTokens + output,
+    helm_usage: "estimate",
   };
 }
 
@@ -1980,8 +2001,10 @@ function sseResponse(run: Run, then: () => void): Response {
       let thinking = false;
       let toolIndex = 0;
       const sink: Sink = {
+        outBytes: 0,
         outputTokens: 0,
         text(text, isThinking) {
+          sink.outBytes += utf8Bytes(text);
           // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD, NOT
           // FENCED TEXT. `reasoning_content` on the delta is the OpenAI
           // convention CLIProxyAPI maps to an Anthropic thinking block
@@ -1996,6 +2019,7 @@ function sseResponse(run: Run, then: () => void): Response {
         },
         toolCall(exec) {
           thinking = false;
+          sink.outBytes += utf8Bytes(exec.toolName) + utf8Bytes(exec.decodedArgs);
           send(chunk({
             tool_calls: [{
               index: toolIndex++,
@@ -2006,9 +2030,7 @@ function sseResponse(run: Run, then: () => void): Response {
           }));
         },
         finish(reason, usage) {
-          const last = chunk({}, reason) as Record<string, unknown>;
-          if (usage) last.usage = usage;
-          send(last);
+          send({ ...chunk({}, reason), usage });
           safeEnqueue("data: [DONE]\n\n");
           if (closed) return;
           closed = true;
@@ -2061,14 +2083,17 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
   let reasoning = "";
   const toolCalls: OpenAIToolCall[] = [];
   const sink: Sink = {
+    outBytes: 0,
     outputTokens: 0,
     // helm patch (2026-08-11): thinking and answer are two streams; keep them
     // apart. Measured: splicing them gave "I am Cursor G 4.5.rok.I am ...".
     text(text, isThinking) {
+      sink.outBytes += utf8Bytes(text);
       if (isThinking) reasoning += text;
       else content += text;
     },
     toolCall(exec) {
+      sink.outBytes += utf8Bytes(exec.toolName) + utf8Bytes(exec.decodedArgs);
       toolCalls.push({
         id: exec.toolCallId,
         type: "function",
@@ -2086,7 +2111,7 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
           created,
           model: run.modelId,
           choices: [{ index: 0, message, finish_reason: reason }],
-          ...(usage ? { usage } : {}),
+          usage,
         }),
         { headers: { "Content-Type": "application/json" } },
       ));
@@ -2103,4 +2128,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { IDLE_TIMEOUT_S, IDLE_MARGIN_MS, stallWindow, conversationContext, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
+export const __test = { IDLE_TIMEOUT_S, IDLE_MARGIN_MS, stallWindow, requestTokens, handleChatCompletion, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
