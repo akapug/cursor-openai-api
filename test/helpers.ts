@@ -2,6 +2,7 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { fromJson } from "@bufbuild/protobuf";
+import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import {
   AgentServerMessageSchema,
   ExecServerMessageSchema,
@@ -11,6 +12,9 @@ import {
   ThinkingDeltaUpdateSchema,
   TokenDeltaUpdateSchema,
   HeartbeatUpdateSchema,
+  ToolCallStartedUpdateSchema,
+  ToolCallCompletedUpdateSchema,
+  ShellArgsSchema,
   ConversationStateStructureSchema,
   ConversationTokenDetailsSchema,
   type AgentServerMessage,
@@ -68,6 +72,55 @@ export function heartbeat(): AgentServerMessage {
       }),
     },
   });
+}
+
+/** Cursor's own bookkeeping: a tool call opens (toolCallStarted) ... */
+export function toolCallStarted(callId: string): AgentServerMessage {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "toolCallStarted", value: create(ToolCallStartedUpdateSchema, { callId }) },
+      }),
+    },
+  });
+}
+
+/** ... and closes (toolCallCompleted) once its exec was answered. */
+export function toolCallCompleted(callId: string): AgentServerMessage {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "toolCallCompleted", value: create(ToolCallCompletedUpdateSchema, { callId }) },
+      }),
+    },
+  });
+}
+
+/** Cursor's own streamed shell, which the bridge refuses. */
+export function shellStreamExec(id: number): AgentServerMessage {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "execServerMessage",
+      value: create(ExecServerMessageSchema, {
+        id,
+        execId: `exec-${id}`,
+        message: { case: "shellStreamArgs", value: create(ShellArgsSchema, { command: "ls", workingDirectory: "/tmp" }) },
+      }),
+    },
+  });
+}
+
+/** An exec on a field this proto does not know, which the bridge leaves unanswered. */
+export function unknownExec(id: number, field = 99): Buffer {
+  const head = toBinary(ExecServerMessageSchema, create(ExecServerMessageSchema, { id, execId: `exec-${id}` }));
+  const exec = new Uint8Array([...head, ...new BinaryWriter().tag(field, WireType.LengthDelimited).string("x").finish()]);
+  const msg = new BinaryWriter().tag(2, WireType.LengthDelimited).bytes(exec).finish();
+  const out = Buffer.alloc(5 + msg.length);
+  out.writeUInt32BE(msg.length, 1);
+  out.set(msg, 5);
+  return out;
 }
 
 export function tokenDelta(tokens: number): AgentServerMessage {
@@ -135,6 +188,10 @@ export function makeRun(bridge: ReturnType<typeof fakeBridge>["bridge"], id = 1)
     stall: null,
     contextTokens: 0,
     heldOutputTokens: 0,
+    openTools: new Set<string>(),
+    lastByteAt: 0,
+    lastProgressAt: 0,
+    lastSentAt: 0,
   } as never;
 }
 
