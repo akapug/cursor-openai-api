@@ -297,8 +297,17 @@ let runSerial = 0;
  * ends a run before this does, so the client is told why in words.
  */
 const IDLE_TIMEOUT_S = 255;
-/** The last moment a watchdog may still speak: 15 s before the idle timeout. */
-const WINDOW_CEILING_MS = (IDLE_TIMEOUT_S - 15) * 1000;
+/** A fresh or resumed request may wait this long before its response attaches. */
+const FIRST_FRAME_MS = 15_000;
+/** Scheduling room after the watchdog speaks and before Bun may cut the request. */
+const IDLE_MARGIN_MS = 15_000;
+/**
+ * The attached response's last safe window. Bun's clock already ran through
+ * the first-frame wait, so both that wait and a real scheduling margin must
+ * fit before its 255 s limit.
+ */
+const WINDOW_CEILING_MS = IDLE_TIMEOUT_S * 1000
+  - FIRST_FRAME_MS - IDLE_MARGIN_MS;
 /** Cursor heartbeats every 10 s; a window under three periods misreads a live stream. */
 const STALL_FLOOR_MS = 30_000;
 const STALL_DEFAULT_MS = 90_000;
@@ -322,7 +331,7 @@ function stallWindow(
   }
   const held = Math.min(Math.max(ms, STALL_FLOOR_MS), WINDOW_CEILING_MS);
   if (held !== ms) {
-    warn(`[bridge] CURSOR_BRIDGE_STALL_MS=${ms} is outside ${STALL_FLOOR_MS}..${WINDOW_CEILING_MS} ms (three of Cursor's 10 s heartbeat periods, and 15 s below the client's idle timeout (${IDLE_TIMEOUT_S} s)); the stall window is ${held} ms`);
+    warn(`[bridge] CURSOR_BRIDGE_STALL_MS=${ms} is outside ${STALL_FLOOR_MS}..${WINDOW_CEILING_MS} ms (three of Cursor's 10 s heartbeat periods, with the ${FIRST_FRAME_MS} ms first-frame wait and ${IDLE_MARGIN_MS} ms scheduling margin inside the client's idle timeout (${IDLE_TIMEOUT_S} s)); the stall window is ${held} ms`);
   }
   return held;
 }
@@ -356,7 +365,7 @@ const limits = {
    * a 200: a fresh run (peekFirstFrame) and a resumed one (awaitFirstFrame)
    * alike. A refusal inside the wait is a real 429.
    */
-  firstFrameMs: 15_000,
+  firstFrameMs: FIRST_FRAME_MS,
 };
 
 // --- H2 Bridge IPC ---
@@ -2094,4 +2103,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { IDLE_TIMEOUT_S, stallWindow, conversationContext, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
+export const __test = { IDLE_TIMEOUT_S, IDLE_MARGIN_MS, stallWindow, conversationContext, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };

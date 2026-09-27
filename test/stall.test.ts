@@ -218,10 +218,10 @@ describe("stall watchdog", () => {
     __test.pausedRuns.clear();
   });
 
-  test("every watchdog window ends a run before the client's idle timeout does", () => {
+  test("the first-frame wait, watchdog, and scheduling margin all fit before Bun's idle timeout", () => {
     const idleMs = __test.IDLE_TIMEOUT_S * 1000;
     expect(__test.IDLE_TIMEOUT_S).toBe(255);      // Bun.serve's maximum
-    expect(saved.idleGuardMs).toBeLessThan(idleMs);
+    expect(saved.firstFrameMs + saved.idleGuardMs + __test.IDLE_MARGIN_MS).toBe(idleMs);
     expect(saved.stallMs).toBe(90_000);
     expect(__test.stallWindow("999999999", () => {})).toBeLessThanOrEqual(saved.idleGuardMs);
   });
