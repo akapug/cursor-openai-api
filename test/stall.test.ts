@@ -155,6 +155,44 @@ describe("stall watchdog", () => {
     expect(fb.state.killed).toBe(true);
   });
 
+  test("a response the client keeps receiving is never cut by the idle guard", async () => {
+    __test.limits.stallMs = 5_000;
+    __test.limits.idleGuardMs = 100;
+    const { fb, resp } = attached();
+    for (let i = 0; i < 15; i++) {
+      fb.feed(frame(textDelta(`${i % 10}`)));
+      await Bun.sleep(20);
+    }
+    fb.close(0);
+    const s = await readSse(resp);
+    expect(s.content).toBe("012345678901234");
+    expect(fb.state.killed).toBe(false);
+  });
+
+  test("a resumed run starts every clock fresh: a pause longer than both windows is not a stall", async () => {
+    __test.limits.stallMs = 60;
+    __test.limits.idleGuardMs = 100;
+    const { fb, resp } = attached();
+    const { mcpCall } = await import("./helpers");
+    fb.feed(frame(toolCallStarted("c1")), frame(mcpCall(1, "call-1", "sleep 1")));
+    const first = await readSse(resp);
+    expect(first.finish).toBe("tool_calls");
+    await Bun.sleep(200);                      // the client's tool runs; nothing is watched
+    const paused = __test.pausedRuns.get(first.toolCalls[0]!.id)!;
+    const next = __test.resumeRun(paused, [{ toolCallId: first.toolCalls[0]!.id, content: "out" }], "", true);
+    // the first frame carries no text, so nothing replayed at attach can
+    // refresh the client's clock for it
+    fb.feed(frame(toolCallCompleted("c1")));
+    const answer = await next!;
+    await Bun.sleep(20);
+    fb.feed(frame(textDelta("after")));
+    fb.close(0);
+    const s = await readSse(answer);
+    expect(s.content).toBe("after");
+    expect(fb.state.killed).toBe(false);
+    __test.pausedRuns.clear();
+  });
+
   test("steady frames keep the watchdog quiet", async () => {
     __test.limits.stallMs = 80;
     const { fb, resp } = attached();
