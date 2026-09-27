@@ -186,6 +186,7 @@ export function makeRun(bridge: ReturnType<typeof fakeBridge>["bridge"], id = 1)
     closed: false,
     expiry: null,
     stall: null,
+    promptTokens: 0,
     contextTokens: 0,
     heldOutputTokens: 0,
     openTools: new Set<string>(),
