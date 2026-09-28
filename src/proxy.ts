@@ -9,6 +9,8 @@
  * - Cursor toolCallStarted/Delta/Completed → OpenAI tool_calls SSE chunks
  * - mcpArgs exec → pause stream, return tool_calls to caller
  * - Follow-up request with tool results → resume bridge with mcpResult
+ * - A native exec (read, shell, grep, ...) whose caller tool is registered →
+ *   that tool's call (translateNative), answered as the native (nativeFrames)
  *
  * HTTP/2 transport is delegated to a Node child process (h2-bridge.mjs)
  * because Bun's node:http2 module is broken.
@@ -28,15 +30,30 @@ import {
   DeleteResultSchema,
   DeleteRejectedSchema,
   DiagnosticsResultSchema,
+  ExecClientControlMessageSchema,
   ExecClientMessageSchema,
+  ExecClientStreamCloseSchema,
   FetchErrorSchema,
   FetchResultSchema,
+  FetchSuccessSchema,
   GetBlobResultSchema,
+  GrepContentMatchSchema,
+  GrepContentResultSchema,
+  GrepCountResultSchema,
   GrepErrorSchema,
+  GrepFileCountSchema,
+  GrepFileMatchSchema,
+  GrepFilesResultSchema,
   GrepResultSchema,
+  GrepSuccessSchema,
+  GrepUnionResultSchema,
   KvClientMessageSchema,
+  LsDirectoryTreeNodeSchema,
+  LsDirectoryTreeNode_FileSchema,
+  LsErrorSchema,
   LsRejectedSchema,
   LsResultSchema,
+  LsSuccessSchema,
   McpErrorSchema,
   McpResultSchema,
   McpSuccessSchema,
@@ -45,28 +62,48 @@ import {
   McpToolNotFoundSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
+  ReadErrorSchema,
   ReadRejectedSchema,
   ReadResultSchema,
+  ReadSuccessSchema,
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
   SetBlobResultSchema,
+  ShellFailureSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  ShellSpawnErrorSchema,
+  ShellStreamExitSchema,
   ShellStreamSchema,
+  ShellStreamStartSchema,
+  ShellStreamStdoutSchema,
+  ShellSuccessSchema,
   UserMessageActionSchema,
   UserMessageSchema,
+  WriteErrorSchema,
   WriteRejectedSchema,
   WriteResultSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
+  WriteSuccessSchema,
   type AgentServerMessage,
   type ExecServerMessage,
+  type FetchArgs,
+  type GrepArgs,
+  type GrepContentMatch,
+  type GrepResult,
+  type GrepUnionResult,
   type KvServerMessage,
+  type LsArgs,
   type McpToolDefinition,
+  type ReadArgs,
+  type ShellArgs,
+  type ShellStream,
+  type WriteArgs,
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
-import { resolve as pathResolve } from "node:path";
+import { join as pathJoin, resolve as pathResolve } from "node:path";
 
 const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -207,6 +244,12 @@ interface PendingExec {
   toolName: string;
   /** Decoded arguments JSON string for SSE tool_calls emission. */
   decodedArgs: string;
+  /**
+   * helm patch (2026-09-28): the Cursor native exec this call stands for
+   * (translateNative). Its answer is that native's own result (nativeFrames),
+   * never an mcpResult.
+   */
+  native?: NativeCall;
 }
 
 /** The h2 child that carries one live Cursor stream. */
@@ -1227,10 +1270,30 @@ function handleExecMessage(
     return;
   }
 
+  // helm patch (2026-09-28): A CURSOR TOOL THE CALLER CAN RUN IS RUN AS THE
+  // CALLER'S TOOL, NEVER REFUSED. MEASURED with CURSOR_BRIDGE_TRACE=1:
+  // grok-4.7-high opens a turn with Cursor's own read. In a short
+  // conversation it followed the refusal's prose (readArgs, refused, the
+  // field-36 MCP-state exec, mcpArgs opencode-Read). In a Claude Code seat's
+  // ~100k-token conversation it did not: it wrote text and ended the turn with
+  // no tool call. Once "the tool runtime refused every call" was in its
+  // history, every later turn gave up the same way for 30 hours, and the seat
+  // looked idle until its context was cleared. A refusal works only while the
+  // model obeys prose, and one miss poisons the session. So a native whose
+  // caller tool is registered goes to the client as that tool's call, the way
+  // an mcpArgs call does, and the client's output goes back to Cursor as the
+  // native's own result (nativeFrames). The model never reads a refusal.
+  const native = translateNative(execMsg, mcpTools);
+  if (native) {
+    onMcpExec(native);
+    return;
+  }
+
   // --- Reject native Cursor tools ---
   // The model tries these first. We must respond with rejection/error
   // so it falls back to our MCP tools (registered via RequestContext), and
-  // the rejection names the route there (rejectReason).
+  // the rejection names the route there (rejectReason). Only natives with no
+  // honest caller equivalent (NATIVE_ROUTES) get here.
   const REJECT_REASON = rejectReason(execCase, mcpTools);
 
   if (execCase === "readArgs") {
@@ -1411,15 +1474,378 @@ function sendExecResult(
   value: unknown,
   sendFrame: (data: Uint8Array) => void,
 ): void {
+  sendFrame(execClientFrame(execMsg, messageCase, value));
+}
+
+/** One exec client message answering the exec `target` names, framed. */
+function execClientFrame(
+  target: { id: number; execId: string },
+  messageCase: string,
+  value: unknown,
+): Buffer {
   const execClientMessage = create(ExecClientMessageSchema, {
-    id: execMsg.id,
-    execId: execMsg.execId,
+    id: target.id,
+    execId: target.execId,
     message: { case: messageCase as any, value: value as any },
   });
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "execClientMessage", value: execClientMessage },
   });
-  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  return frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage));
+}
+
+// --- Cursor's own tools, run as the caller's (helm patch 2026-09-28) ---
+
+type NativeCase = "readArgs" | "shellArgs" | "shellStreamArgs" | "grepArgs" | "writeArgs" | "lsArgs" | "fetchArgs";
+type NativeArgs = ReadArgs | ShellArgs | GrepArgs | WriteArgs | LsArgs | FetchArgs;
+type ExecArgs<C extends NativeCase> = Extract<ExecServerMessage["message"], { case: C }>["value"];
+
+/** A native exec a caller tool call stands for (PendingExec.native). */
+interface NativeCall {
+  case: NativeCase;
+  args: NativeArgs;
+}
+
+/** One ExecClientMessage answer: its oneof case and value. */
+interface ExecAnswer {
+  case: string;
+  value: unknown;
+}
+
+/** A caller tool's arguments: `need` must fit its schema, `may` goes out where the schema declares it (fitSchema). */
+interface CallerArgs {
+  need: Record<string, unknown>;
+  may?: Record<string, unknown>;
+}
+
+interface NativeRoute<A> {
+  /** The caller tool that does this native's job. */
+  tool: string;
+  /** Its answer has a text field, so text sent with the results can ride it (resumeRun). */
+  carriesText: boolean;
+  /** Answered on a stream: its events, then streamClose, as Cursor's own CLI does. */
+  streamed?: boolean;
+  /** The caller tool's arguments, or null when this call has no honest translation. */
+  call(a: A): CallerArgs | null;
+  /** The native's own result for the client's output (undefined: none came back). */
+  answer(a: A, out: string | undefined, note: string): ExecAnswer[];
+}
+
+const NOT_PROVIDED = "Tool result not provided";
+
+/**
+ * What the client's tool did, read from its words: CLIProxyAPI drops a tool
+ * result's is_error on the way to OpenAI form, so the text is all the bridge
+ * gets. Claude Code wraps a call it refused or could not run in
+ * <tool_use_error>; that, or no result at all, is a failure, and anything
+ * else is the tool's output.
+ */
+function outcome(out: string | undefined): { ok: true; text: string } | { ok: false; why: string } {
+  if (out === undefined) return { ok: false, why: NOT_PROVIDED };
+  const m = /^\s*<tool_use_error>([\s\S]*)<\/tool_use_error>\s*$/.exec(out);
+  return m ? { ok: false, why: m[1]! } : { ok: true, text: out };
+}
+
+/** A command's exit code and output: Claude Code's Bash starts a non-zero exit with "Exit code N". */
+function exitStatus(out: string): { code: number; text: string } {
+  const m = /^Exit code (\d+)\n?/.exec(out);
+  return m ? { code: Number(m[1]), text: out.slice(m[0].length) } : { code: 0, text: out };
+}
+
+/** One single-quoted shell word. */
+function shellWord(s: string): string {
+  return `'${s.replaceAll("'", `'\\''`)}'`;
+}
+
+function lineCount(text: string): number {
+  return text ? text.split("\n").length - (text.endsWith("\n") ? 1 : 0) : 0;
+}
+
+/** The command a native shell runs as: in its working directory, when it names one. */
+function inDirectory(a: ShellArgs): CallerArgs | null {
+  // A background shell is one Cursor addresses later by shell id and pid;
+  // the caller's Bash gives neither, so it keeps the refusal.
+  if (a.isBackground) return null;
+  return { need: { command: a.workingDirectory ? `cd ${shellWord(a.workingDirectory)} && ${a.command}` : a.command } };
+}
+
+function shellAnswer(a: ShellArgs, out: string | undefined, note: string): ExecAnswer[] {
+  const where = { command: a.command, workingDirectory: a.workingDirectory };
+  const o = outcome(out);
+  if (!o.ok) {
+    const result = { case: "spawnError" as const, value: create(ShellSpawnErrorSchema, { ...where, error: o.why + note }) };
+    return [{ case: "shellResult", value: create(ShellResultSchema, { result }) }];
+  }
+  const { code, text } = exitStatus(o.text);
+  const result = code === 0
+    ? { case: "success" as const, value: create(ShellSuccessSchema, { ...where, exitCode: 0, stdout: text + note }) }
+    : { case: "failure" as const, value: create(ShellFailureSchema, { ...where, exitCode: code, stdout: text + note }) };
+  return [{ case: "shellResult", value: create(ShellResultSchema, { result }) }];
+}
+
+/** A streamed shell's events, in the order Cursor's CLI sends them: start, output, exit. */
+function shellStreamAnswer(a: ShellArgs, out: string | undefined, note: string): ExecAnswer[] {
+  const event = (e: ShellStream["event"]): ExecAnswer => ({ case: "shellStream", value: create(ShellStreamSchema, { event: e }) });
+  const o = outcome(out);
+  if (!o.ok) {
+    return [event({ case: "rejected", value: create(ShellRejectedSchema, {
+      command: a.command, workingDirectory: a.workingDirectory, reason: o.why + note, isReadonly: false,
+    }) })];
+  }
+  const { code, text } = exitStatus(o.text);
+  const stdout = text + note;
+  return [
+    event({ case: "start", value: create(ShellStreamStartSchema, {}) }),
+    ...(stdout ? [event({ case: "stdout", value: create(ShellStreamStdoutSchema, { data: stdout }) })] : []),
+    event({ case: "exit", value: create(ShellStreamExitSchema, { code, cwd: a.workingDirectory }) }),
+  ];
+}
+
+/** Cursor's grep reads output_mode "content" when none is given (its CLI's grep executor). */
+const grepMode = (a: GrepArgs): string => a.outputMode || "content";
+
+/** One line of Claude Code's content-mode Grep: "path:N:text" (a match) or "path-N-text" (context). */
+function grepLine(line: string, files: string[], single: string | null) {
+  if (single !== null) {
+    const m = /^(\d+)([:-])([\s\S]*)$/.exec(line);
+    return m ? { file: single, n: Number(m[1]), text: m[3]!, context: m[2] === "-" } : null;
+  }
+  // Shortest known file first: a context line whose text holds ":N:" also
+  // reads as a match line of a longer, made-up path.
+  for (const file of files) {
+    const m = line.startsWith(file) ? /^([:-])(\d+)\1([\s\S]*)$/.exec(line.slice(file.length)) : null;
+    if (m) return { file, n: Number(m[2]), text: m[3]!, context: m[1] === "-" };
+  }
+  return null;
+}
+
+/**
+ * Claude Code's Grep answer read back into Cursor's grep result, one reader
+ * per output mode. Every line must land in the result: a line that does not
+ * read makes the whole answer the grep's error carrying the text (grepArgs),
+ * never a match list with lines missing.
+ */
+const GREP_READERS: Record<string, (text: string, a: GrepArgs) => GrepUnionResult["result"] | null> = {
+  files_with_matches(text) {
+    if (text.trim() === "No files found") return { case: "files", value: create(GrepFilesResultSchema, {}) };
+    const [head, ...files] = text.split("\n").filter(Boolean);
+    if (!head || !/^Found \d+ files?\b/.test(head)) return null;
+    return { case: "files", value: create(GrepFilesResultSchema, { files, totalFiles: files.length }) };
+  },
+  count(text) {
+    if (text.trim() === "No matches found") return { case: "count", value: create(GrepCountResultSchema, {}) };
+    const counts = text.split("\n")
+      .filter((l) => l && !/^Found \d+ total occurrences? across \d+ files?\b/.test(l))
+      .map((l) => ({ file: l.slice(0, l.lastIndexOf(":")), count: Number(l.slice(l.lastIndexOf(":") + 1)) }));
+    if (counts.some((c) => !c.file || !Number.isInteger(c.count))) return null;
+    return { case: "count", value: create(GrepCountResultSchema, {
+      counts: counts.map((c) => create(GrepFileCountSchema, c)),
+      totalFiles: counts.length,
+      totalMatches: counts.reduce((n, c) => n + c.count, 0),
+    }) };
+  },
+  content(text, a) {
+    const lines = text.trim() === "No matches found" ? [] : text.split("\n")
+      .filter((l) => l && l !== "--" && !/^\[Showing results with pagination = .*\]$/.test(l));
+    // One file searched prints "N:text"; a directory prints "path:N:text".
+    const single = lines.every((l) => /^\d+[:-]/.test(l)) ? a.path ?? "" : null;
+    const files = [...new Set(lines.flatMap((l) => /^(.*?):\d+:/.exec(l)?.[1] ?? []))].sort((x, y) => x.length - y.length);
+    const hits = lines.map((l) => grepLine(l, files, single));
+    if (hits.some((h) => h === null)) return null;
+    const byFile = new Map<string, GrepContentMatch[]>();
+    for (const h of hits as NonNullable<(typeof hits)[number]>[]) {
+      if (!byFile.has(h.file)) byFile.set(h.file, []);
+      byFile.get(h.file)!.push(create(GrepContentMatchSchema, { lineNumber: h.n, content: h.text, isContextLine: h.context }));
+    }
+    return { case: "content", value: create(GrepContentResultSchema, {
+      matches: [...byFile].map(([file, matches]) => create(GrepFileMatchSchema, { file, matches })),
+      totalLines: hits.length,
+      totalMatchedLines: hits.filter((h) => !h!.context).length,
+    }) };
+  },
+};
+
+/** The line a translated listing ends with: a listing the client cut short or reworded lacks it. */
+const LS_END = "-- end of listing --";
+
+/**
+ * Each native the bridge runs as a caller tool: the tool, its arguments, and
+ * how the client's output becomes the native's own result. Natives not here
+ * (delete, background shells, stdin writes, and the rest) keep the refusal:
+ * each is destructive or has no caller tool whose output gives its result
+ * honestly. A read maps to Read only, never to Bash cat: a caller that
+ * registered Bash but no Read chose that, and the refusal names Bash.
+ */
+const NATIVE_ROUTES: { [C in NativeCase]: NativeRoute<ExecArgs<C>> } = {
+  readArgs: {
+    tool: "Read",
+    carriesText: true,
+    call: (a) => ({ need: { file_path: a.path } }),
+    answer(a, out, note) {
+      const o = outcome(out);
+      const result = o.ok
+        ? { case: "success" as const, value: create(ReadSuccessSchema, {
+            path: a.path, totalLines: lineCount(o.text), output: { case: "content", value: o.text + note },
+          }) }
+        : { case: "error" as const, value: create(ReadErrorSchema, { path: a.path, error: o.why + note }) };
+      return [{ case: "readResult", value: create(ReadResultSchema, { result }) }];
+    },
+  },
+  shellArgs: { tool: "Bash", carriesText: true, call: inDirectory, answer: shellAnswer },
+  shellStreamArgs: { tool: "Bash", carriesText: true, streamed: true, call: inDirectory, answer: shellStreamAnswer },
+  grepArgs: {
+    tool: "Grep",
+    carriesText: false,
+    // Cursor's sort and sort_ascending have no Grep field and are dropped.
+    call: (a) => ({
+      need: { pattern: a.pattern, output_mode: grepMode(a) },
+      may: {
+        path: a.path, glob: a.glob, "-B": a.contextBefore, "-A": a.contextAfter, "-C": a.context,
+        "-i": a.caseInsensitive, type: a.type, head_limit: a.headLimit, multiline: a.multiline,
+        "-n": grepMode(a) === "content" || undefined,
+      },
+    }),
+    answer(a, out) {
+      const grep = (result: GrepResult["result"]): ExecAnswer[] => [{ case: "grepResult", value: create(GrepResultSchema, { result }) }];
+      const o = outcome(out);
+      if (!o.ok) return grep({ case: "error", value: create(GrepErrorSchema, { error: o.why }) });
+      const found = GREP_READERS[grepMode(a)]?.(o.text, a);
+      if (!found) {
+        return grep({ case: "error", value: create(GrepErrorSchema, {
+          error: `The caller's Grep answered in a form the bridge cannot split into ${grepMode(a)} results; its whole answer:\n${o.text}`,
+        }) });
+      }
+      // Claude Code prints each path as the search was given it, so the
+      // workspace key is empty rather than a root the paths would be joined to.
+      return grep({ case: "success", value: create(GrepSuccessSchema, {
+        pattern: a.pattern, path: a.path ?? "", outputMode: grepMode(a),
+        workspaceResults: { "": create(GrepUnionResultSchema, { result: found }) },
+      }) });
+    },
+  },
+  writeArgs: {
+    tool: "Write",
+    carriesText: false,
+    call: (a) => (a.fileBytes.length ? null : { need: { file_path: a.path, content: a.fileText } }),
+    answer(a, out) {
+      // A write's success carries no text, so it is a success only when the
+      // client said so ("File created successfully at", "The file ... has
+      // been updated successfully"); any other words are its error.
+      const o = outcome(out);
+      const why = !o.ok ? o.why : /\bsuccessfully\b/.test(o.text) ? null : o.text;
+      const result = why === null
+        ? { case: "success" as const, value: create(WriteSuccessSchema, {
+            path: a.path, linesCreated: lineCount(a.fileText), fileSize: utf8Bytes(a.fileText),
+            ...(a.returnFileContentAfterWrite && { fileContentAfterWrite: a.fileText }),
+          }) }
+        : { case: "error" as const, value: create(WriteErrorSchema, { path: a.path, error: why }) };
+      return [{ case: "writeResult", value: create(WriteResultSchema, { result }) }];
+    },
+  },
+  lsArgs: {
+    // Bash, not Glob: Glob lists files only, and a listing's tree needs its
+    // directories. `ls -1Ap` prints one name per line with "/" on each
+    // directory, and LS_END proves the whole listing came back. Cursor's
+    // ignore globs are not applied.
+    tool: "Bash",
+    carriesText: false,
+    call: (a) => ({ need: { command: `ls -1Ap -- ${shellWord(a.path || ".")} && echo ${shellWord(LS_END)}` } }),
+    answer(a, out) {
+      const o = outcome(out);
+      const names = o.ok ? o.text.split("\n").filter(Boolean) : [];
+      const why = !o.ok ? o.why : names.at(-1) === LS_END ? null : o.text;
+      if (why !== null) {
+        return [{ case: "lsResult", value: create(LsResultSchema, {
+          result: { case: "error", value: create(LsErrorSchema, { path: a.path, error: why }) },
+        }) }];
+      }
+      const entries = names.slice(0, -1);
+      const files = entries.filter((n) => !n.endsWith("/"));
+      const root = create(LsDirectoryTreeNodeSchema, {
+        absPath: a.path,
+        childrenDirs: entries.filter((n) => n.endsWith("/"))
+          .map((d) => create(LsDirectoryTreeNodeSchema, { absPath: pathJoin(a.path, d.slice(0, -1)) })),
+        childrenFiles: files.map((name) => create(LsDirectoryTreeNode_FileSchema, { name })),
+        childrenWereProcessed: true,
+        numFiles: files.length,
+      });
+      return [{ case: "lsResult", value: create(LsResultSchema, {
+        result: { case: "success", value: create(LsSuccessSchema, { directoryTreeRoot: root }) },
+      }) }];
+    },
+  },
+  fetchArgs: {
+    tool: "WebFetch",
+    carriesText: true,
+    call: (a) => ({ need: { url: a.url }, may: { prompt: "Return the page content." } }),
+    // WebFetch's answer carries no HTTP status, so none is reported.
+    answer(a, out, note) {
+      const o = outcome(out);
+      const result = o.ok
+        ? { case: "success" as const, value: create(FetchSuccessSchema, { url: a.url, content: o.text + note }) }
+        : { case: "error" as const, value: create(FetchErrorSchema, { url: a.url, error: o.why + note }) };
+      return [{ case: "fetchResult", value: create(FetchResultSchema, { result }) }];
+    },
+  },
+};
+
+function routeOf(c: NativeCase): NativeRoute<NativeArgs> {
+  return NATIVE_ROUTES[c] as NativeRoute<NativeArgs>;
+}
+
+/**
+ * The arguments that go out, fitted to the schema the caller registered for
+ * its tool: a `may` field it does not declare is dropped, and a `need` field
+ * it does not declare, or a field it requires that this call cannot fill,
+ * means the call is not made (the refusal names the tool instead). A schema
+ * with no properties object is taken as it stands.
+ */
+function fitSchema(tool: McpToolDefinition, args: CallerArgs): Record<string, unknown> | null {
+  const schema = decodeMcpArgValue(tool.inputSchema);
+  const { properties, required } = (schema && typeof schema === "object" ? schema : {}) as { properties?: unknown; required?: unknown };
+  const declared = properties && typeof properties === "object" ? new Set(Object.keys(properties)) : null;
+  if (declared && Object.keys(args.need).some((k) => !declared.has(k))) return null;
+  const may = Object.entries(args.may ?? {}).filter(([k, v]) => v !== undefined && (!declared || declared.has(k)));
+  const out = { ...args.need, ...Object.fromEntries(may) };
+  return (Array.isArray(required) ? required : []).every((k) => k in out) ? out : null;
+}
+
+/** A native exec as the caller tool call that does its job, or null when it stays refused. */
+function translateNative(execMsg: ExecServerMessage, mcpTools: McpToolDefinition[]): PendingExec | null {
+  const { case: c, value } = execMsg.message;
+  if (!c || !Object.hasOwn(NATIVE_ROUTES, c)) return null;
+  const route = routeOf(c as NativeCase);
+  const tool = mcpTools.find((t) => (t.toolName || t.name) === route.tool);
+  if (!tool) return null;
+  const call = route.call(value as NativeArgs);
+  const args = call && fitSchema(tool, call);
+  if (!args) return null;
+  const cursorToolCallId = (value as NativeArgs).toolCallId || crypto.randomUUID();
+  trace(`native ${c} runs as the caller's ${route.tool}`);
+  return {
+    execId: execMsg.execId,
+    execMsgId: execMsg.id,
+    toolCallId: clientToolCallId(cursorToolCallId),
+    cursorToolCallId,
+    toolName: route.tool,
+    decodedArgs: JSON.stringify(args),
+    native: { case: c as NativeCase, args: value as NativeArgs },
+  };
+}
+
+/** Cursor's answer to a translated native: its own result, then streamClose when it streams. */
+function nativeFrames(exec: PendingExec, out: string | undefined, note: string): Buffer[] {
+  const route = routeOf(exec.native!.case);
+  const target = { id: exec.execMsgId, execId: exec.execId };
+  const frames = route.answer(exec.native!.args, out, note).map((a) => execClientFrame(target, a.case, a.value));
+  if (!route.streamed) return frames;
+  const control = create(ExecClientControlMessageSchema, {
+    message: { case: "streamClose", value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }) },
+  });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "execClientControlMessage", value: control },
+  });
+  return [...frames, frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage))];
 }
 
 // --- Runs: one Cursor stream, across the client's tool round trips ---
@@ -1781,17 +2207,25 @@ function resumeRun(
   ));
   // Text the client sent alongside its tool results (Claude Code appends
   // reminders, and a user who interrupts types here) has nowhere else to go
-  // on a paused run: it rides the last result instead of vanishing.
+  // on a paused run: it rides the last result instead of vanishing. A
+  // translated native's result carries it only where the native's answer has
+  // text (NativeRoute.carriesText): a listing, a grep or a write has none.
+  const carries = (i: number): boolean => answered[i] !== undefined
+    && (!run.awaiting[i]!.native || routeOf(run.awaiting[i]!.native!.case).carriesText);
   let last = answered.length - 1;
-  while (last >= 0 && !answered[last]) last--;
-  if (userText && last >= 0) {
-    answered[last] = { ...answered[last]!, content: `${answered[last]!.content}\n\n<user_message>\n${userText}\n</user_message>` };
-  } else if (userText) {
+  while (last >= 0 && !carries(last)) last--;
+  if (userText && last < 0) {
     console.error(`[bridge] run ${run.id}: user text with no matching tool result was dropped`);
   }
+  const note = userText ? `\n\n<user_message>\n${userText}\n</user_message>` : "";
   for (const [i, exec] of run.awaiting.entries()) {
     const result = answered[i];
+    const ride = i === last ? note : "";
     if (!result) console.error(`[bridge] run ${run.id}: no result for tool call ${exec.toolCallId}`);
+    if (exec.native) {
+      for (const frame of nativeFrames(exec, result?.content, ride)) run.bridge.write(frame);
+      continue;
+    }
     const mcpResult = result
       ? create(McpResultSchema, {
           result: {
@@ -1801,7 +2235,7 @@ function resumeRun(
                 create(McpToolResultContentItemSchema, {
                   content: {
                     case: "text",
-                    value: create(McpTextContentSchema, { text: result.content }),
+                    value: create(McpTextContentSchema, { text: result.content + ride }),
                   },
                 }),
               ],
@@ -1812,7 +2246,7 @@ function resumeRun(
       : create(McpResultSchema, {
           result: {
             case: "error",
-            value: create(McpErrorSchema, { error: "Tool result not provided" }),
+            value: create(McpErrorSchema, { error: NOT_PROVIDED }),
           },
         });
     const execClientMessage = create(ExecClientMessageSchema, {
