@@ -418,6 +418,12 @@ const limits = {
    * alike. A refusal inside the wait is a real 429.
    */
   firstFrameMs: FIRST_FRAME_MS,
+  /**
+   * helm patch (2026-09-29): how far into a file the bridge reads to fit a
+   * native read to READ_BYTE_BOUND (fitToBytes). A window past it cannot be
+   * proven to fit, so that read fails closed.
+   */
+  readScanBytes: 64 * 1024 * 1024,
 };
 
 // --- H2 Bridge IPC ---
@@ -1750,36 +1756,44 @@ const readWant = (r: ReadRange): number => Math.min(r.limit ?? Infinity, READ_BO
  * (the caller's disk, where the bridge runs beside the client as helm runs
  * it) and asks for no more lines than fit READ_BYTE_BOUND as Read prints
  * them. It reads the file only to count bytes; none of it goes to the client
- * or to Cursor. A path it cannot measure (relative, which it cannot place;
- * not a regular file; unreadable; the window past READ_SCAN_BYTES) goes out
- * for READ_BOUND lines, and then only the text returned to Cursor is held to
- * the byte bound (capRead).
+ * or to Cursor. A read whose fit it cannot prove (a relative path, which it
+ * cannot place; a file not on its disk, not a regular file, or unreadable; a
+ * window past limits.readScanBytes) FAILS CLOSED: the client is never called,
+ * and the read's error names the route (readPlan). The seat's reads are all
+ * absolute local paths, and Claude Code's Read takes only absolute paths.
  */
-const READ_SCAN_BYTES = 64 * 1024 * 1024;
 const READ_SCAN_CHUNK = 1024 * 1024;
 
 /** Bytes of one line as Claude Code's Read prints it: "N<tab>text<newline>". */
 const printedBytes = (n: number, bytes: number): number => String(n).length + 2 + bytes;
 
+/** How a read of a file fits READ_BYTE_BOUND (fitToBytes). */
+type ReadFit = { lines: number } | { hugeLine: number } | { unknown: string } | null;
+
 /**
  * How far a read of `path` from line `first` gets within READ_BYTE_BOUND:
  * { lines } when the bound stops it before `want` lines and the file's end;
- * { hugeLine } when line `first` alone passes the bound; null when nothing
- * needs cutting or the file cannot be measured here.
+ * { hugeLine } when line `first` alone passes the bound; { unknown } with
+ * why, when the fit cannot be proven here; null when nothing needs cutting.
  */
-function fitToBytes(path: string, first: number, want: number): { lines: number } | { hugeLine: number } | null {
+function fitToBytes(path: string, first: number, want: number): ReadFit {
+  if (!isAbsolute(path)) return { unknown: "it is not an absolute path on this machine" };
   let fd: number;
   try {
-    if (!isAbsolute(path) || !statSync(path).isFile()) return null;
+    if (!statSync(path).isFile()) return { unknown: "it is not a regular file" };
     fd = openSync(path, "r");
-  } catch {
-    return null;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return { unknown: code === "ENOENT" ? "no file is at that path on this machine" : `it cannot be read here (${code ?? e})` };
   }
   try {
     const chunk = Buffer.alloc(READ_SCAN_CHUNK);
     let line = 1, bytes = 0, used = 0, taken = 0;
-    for (let pos = 0, n = 0; pos < READ_SCAN_BYTES; pos += n) {
-      n = readSync(fd, chunk, 0, chunk.length, pos);
+    for (let pos = 0, n = 0; ; pos += n) {
+      if (pos >= limits.readScanBytes) {
+        return { unknown: `the lines it asks for lie past the first ${limits.readScanBytes} bytes the bridge measures` };
+      }
+      n = readSync(fd, chunk, 0, Math.min(chunk.length, limits.readScanBytes - pos), pos);
       if (n === 0) return null;   // the file ended within the bound
       const view = chunk.subarray(0, n);
       for (let i = 0; i < n;) {
@@ -1798,9 +1812,8 @@ function fitToBytes(path: string, first: number, want: number): { lines: number 
         i = nl + 1;
       }
     }
-    return null;   // the window lies past READ_SCAN_BYTES
-  } catch {
-    return null;
+  } catch (e) {
+    return { unknown: `it cannot be read here (${(e as NodeJS.ErrnoException).code ?? e})` };
   } finally {
     closeSync(fd);
   }
@@ -1817,9 +1830,10 @@ function readError(a: ReadArgs, error: string): BridgeAnswer {
  * A native read as the caller's Read, or as the bridge's own answer when
  * Read cannot do it within the bounds: a read from the end (Read counts from
  * the start, and marking the first lines as the last would be the wrong
- * slice as a success), or a line that alone passes READ_BYTE_BOUND (Read
- * cannot read part of a line). Each is that one request's error naming the
- * Shell route, never a refusal of the tool.
+ * slice as a success); a line that alone passes READ_BYTE_BOUND (Read cannot
+ * read part of a line); a read whose fit the bridge cannot prove (it fails
+ * closed). Each is that one request's error naming the route, never a
+ * refusal of the tool.
  */
 function readPlan(a: ReadArgs): CallerArgs | BridgeAnswer {
   const r = readRange(a);
@@ -1833,6 +1847,13 @@ function readPlan(a: ReadArgs): CallerArgs | BridgeAnswer {
   }
   const first = Math.max(r.offset ?? 1, 1);
   const fit = fitToBytes(a.path, first, readWant(r));
+  if (fit && "unknown" in fit) {
+    trace(`native readArgs cannot be measured (${fit.unknown}): answered with the Shell route`);
+    return readError(a, `The bridge cannot measure ${a.path}: ${fit.unknown}, so this read could bring more than ` +
+      `${READ_BYTE_BOUND} bytes into the caller's context and was not made. ` +
+      `${isAbsolute(a.path) ? "With the Shell tool, read" : "Read it by its absolute path on this machine, or with the Shell tool read"} ` +
+      `the lines with sed -n '${first},${first + readWant(r) - 1}p' ${file} | cut -b 1-${READ_BYTE_BOUND} | head -c ${READ_BYTE_BOUND}.`);
+  }
   if (fit && "hugeLine" in fit) {
     const n = fit.hugeLine;
     trace(`native readArgs line ${n} passes ${READ_BYTE_BOUND} bytes: answered with the Shell route`);
@@ -1850,7 +1871,8 @@ function readPlan(a: ReadArgs): CallerArgs | BridgeAnswer {
  * The client's Read output held to READ_BYTE_BOUND bytes on its way to
  * Cursor: cut after its last whole line within the bound ("lines"), or, when
  * its first line alone passes it, at the last whole character within it
- * ("line").
+ * ("line"). The measure keeps the client's read within the bound; this holds
+ * Cursor's side too when the file grew between the measure and the read.
  */
 function capRead(text: string): { text: string; cut: "lines" | "line" | null } {
   const buf = Buffer.from(text, "utf8");
