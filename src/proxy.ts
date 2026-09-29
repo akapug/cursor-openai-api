@@ -11,7 +11,8 @@
  * - Follow-up request with tool results → resume bridge with mcpResult
  * - A native exec (read, shell, grep, ...) whose caller tool is registered →
  *   that tool's call (translateNative), answered as the native (nativeFrames);
- *   a read brings at most READ_BOUND lines into the caller's context
+ *   a read brings at most READ_BOUND lines and READ_BYTE_BOUND bytes of a file
+ *   into the caller's context
  *
  * HTTP/2 transport is delegated to a Node child process (h2-bridge.mjs)
  * because Bun's node:http2 module is broken.
@@ -104,7 +105,8 @@ import {
   type WriteArgs,
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
-import { join as pathJoin, resolve as pathResolve } from "node:path";
+import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { isAbsolute, join as pathJoin, resolve as pathResolve } from "node:path";
 
 const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -1283,8 +1285,15 @@ function handleExecMessage(
   // model obeys prose, and one miss poisons the session. So a native whose
   // caller tool is registered goes to the client as that tool's call, the way
   // an mcpArgs call does, and the client's output goes back to Cursor as the
-  // native's own result (nativeFrames). The model never reads a refusal.
+  // native's own result (nativeFrames). The model never reads a refusal. A
+  // request the caller's tool cannot fulfil (a read from the end, a line past
+  // the byte bound) is answered by the bridge with that request's error,
+  // naming the route to what it asked (BridgeAnswer).
   const native = translateNative(execMsg, mcpTools);
+  if (Array.isArray(native)) {
+    for (const frame of native) sendFrame(frame);
+    return;
+  }
   if (native) {
     onMcpExec(native);
     return;
@@ -1526,10 +1535,24 @@ interface NativeRoute<A> {
   carriesText: boolean;
   /** Answered on a stream: its events, then streamClose, as Cursor's own CLI does. */
   streamed?: boolean;
-  /** The caller tool's arguments, or null when this call has no honest translation. */
-  call(a: A): CallerArgs | null;
-  /** The native's own result for the client's output (undefined: none came back). */
-  answer(a: A, out: string | undefined, note: string): ExecAnswer[];
+  /**
+   * The caller tool's arguments; the native's answer, given by the bridge
+   * with no call, for a request the caller tool cannot fulfil (BridgeAnswer);
+   * or null when this call has no honest translation.
+   */
+  call(a: A): CallerArgs | BridgeAnswer | null;
+  /** The native's own result for the client's output (undefined: none came back) to the call `sent`. */
+  answer(a: A, out: string | undefined, note: string, sent: Record<string, unknown>): ExecAnswer[];
+}
+
+/**
+ * A native the bridge answers itself, with no client call: an error result
+ * for that one request, naming the route to what it asked. Narrower than a
+ * refusal: it says what this request cannot do here, not that the tool is
+ * refused.
+ */
+interface BridgeAnswer {
+  answer: ExecAnswer[];
 }
 
 const NOT_PROVIDED = "Tool result not provided";
@@ -1670,20 +1693,23 @@ const GREP_READERS: Record<string, (text: string, a: GrepArgs) => GrepUnionResul
 const LS_END = "-- end of listing --";
 
 /**
- * helm patch (2026-09-29): THE MOST LINES ONE OF CURSOR'S READS BRINGS INTO
- * THE CALLER'S CONTEXT. MEASURED on the cursor seat's Claude Code
- * transcript: each read went out as a Read with only file_path, so Claude
- * Code read the whole file (a 100,627-character module twice within 2 s,
- * then 53 KB and 99 KB more); the conversation went from about 90k to 155k
- * tokens in five seconds and compacted, every three minutes. That module's
- * code runs about 55 characters a line (1,836 lines), so 400 lines is about
- * 22 KB, some 5,500 tokens by the bridge's bytes-over-four estimate: room
- * for a function and its neighbours, and a dozen reads before a compaction
- * where the whole file allowed two. A file of long lines (Markdown with a
- * paragraph a line) carries more per line; Claude Code's own per-read cap
- * stays the ceiling there.
+ * helm patch (2026-09-29): THE MOST OF A FILE ONE OF CURSOR'S READS BRINGS
+ * INTO THE CALLER'S CONTEXT: READ_BOUND lines, and READ_BYTE_BOUND bytes of
+ * its text as the caller's Read prints it. MEASURED on the cursor seat's
+ * Claude Code transcript: each read went out as a Read with only file_path,
+ * so Claude Code read the whole file (a 100,627-character module twice
+ * within 2 s, then 53 KB and 99 KB more); the conversation went from about
+ * 90k to 155k tokens in five seconds and compacted, every three minutes.
+ * That module's code runs about 55 characters a line (1,836 lines), so 400
+ * lines is about 22 KB, and 24,000 bytes some 6,000 tokens by the bridge's
+ * bytes-over-four estimate: room for a function and its neighbours, and a
+ * dozen reads before a compaction where the whole file allowed two. Lines
+ * alone do not bound a file of long lines (the seat's 99 KB WEB.md has 339),
+ * and MEASURED on Claude Code 2.1.284, its Read prints a 9,014-character
+ * line whole, so the byte bound holds there.
  */
 const READ_BOUND = 400;
+const READ_BYTE_BOUND = 24_000;
 
 // agent.v1.ReadArgs.offset = 4 (int32) and .limit = 5 (uint32), and
 // ReadSuccess.range_applied = 8 (bool), from Cursor's CLI bundles
@@ -1699,59 +1725,170 @@ function unknownVarint(m: ReadArgs, no: number, read: (r: BinaryReader) => numbe
   return f && read(new BinaryReader(f.data));
 }
 
-/** The lines a native read goes out for (readWindow). */
-interface ReadWindow {
-  /** Read's offset: the first line, when that is past line 1. */
+/** A read's own range. */
+interface ReadRange {
+  /** The first line, 1-based as Cursor's CLI reads it (0 reads as 1); negative counts from the end. */
   offset?: number;
-  /** Read's limit: the lines asked for, never more than READ_BOUND. */
-  limit: number;
-  /** The read named its lines, so the client's output is already the answer (range_applied). */
-  ranged: boolean;
-  /** READ_BOUND, not the read, set the limit, so output that reaches it may stop short. */
-  capped: boolean;
-  /** The lines from the end a negative offset asks for; Read cannot start there. */
-  fromEnd?: number;
+  /** The lines asked for; none reads to the end. */
+  limit?: number;
 }
 
-/**
- * A native read's lines, taken as Cursor's CLI executor takes them (the
- * first line 1-based, 0 read as 1; a negative offset counts from the end,
- * with that many lines unless a limit is given; no limit reads to the end),
- * fitted to Read and to READ_BOUND. A read from the end becomes the first
- * READ_BOUND lines: Read counts from the start only.
- */
-function readWindow(a: ReadArgs): ReadWindow {
+function readRange(a: ReadArgs): ReadRange {
   const offset = unknownVarint(a, READ_OFFSET_FIELD, (r) => r.int32());
-  const asked = unknownVarint(a, READ_LIMIT_FIELD, (r) => r.uint32()) || undefined;
-  const fromEnd = offset !== undefined && offset < 0 ? -offset : undefined;
-  const want = fromEnd ? Infinity : asked ?? Infinity;
-  return {
-    ...(offset !== undefined && offset > 1 && { offset }),
-    limit: Math.min(want, READ_BOUND),
-    ranged: offset !== undefined || asked !== undefined,
-    capped: want > READ_BOUND,
-    ...(fromEnd !== undefined && { fromEnd }),
-  };
+  const limit = unknownVarint(a, READ_LIMIT_FIELD, (r) => r.uint32()) || undefined;
+  return { ...(offset !== undefined && { offset }), ...(limit !== undefined && { limit }) };
+}
+
+/** The lines a read goes out for when no byte bound stops it first. */
+const readWant = (r: ReadRange): number => Math.min(r.limit ?? Infinity, READ_BOUND);
+
+/**
+ * THE CLIENT'S READ IS WHAT FILLS ITS CONTEXT. The caller's Read runs on the
+ * client, which keeps its output in its conversation before the bridge sees
+ * it, and Read takes no byte limit: the one lever on that side is how many
+ * lines the Read asks for. So the bridge measures the file on its own disk
+ * (the caller's disk, where the bridge runs beside the client as helm runs
+ * it) and asks for no more lines than fit READ_BYTE_BOUND as Read prints
+ * them. It reads the file only to count bytes; none of it goes to the client
+ * or to Cursor. A path it cannot measure (relative, which it cannot place;
+ * not a regular file; unreadable; the window past READ_SCAN_BYTES) goes out
+ * for READ_BOUND lines, and then only the text returned to Cursor is held to
+ * the byte bound (capRead).
+ */
+const READ_SCAN_BYTES = 64 * 1024 * 1024;
+const READ_SCAN_CHUNK = 1024 * 1024;
+
+/** Bytes of one line as Claude Code's Read prints it: "N<tab>text<newline>". */
+const printedBytes = (n: number, bytes: number): number => String(n).length + 2 + bytes;
+
+/**
+ * How far a read of `path` from line `first` gets within READ_BYTE_BOUND:
+ * { lines } when the bound stops it before `want` lines and the file's end;
+ * { hugeLine } when line `first` alone passes the bound; null when nothing
+ * needs cutting or the file cannot be measured here.
+ */
+function fitToBytes(path: string, first: number, want: number): { lines: number } | { hugeLine: number } | null {
+  let fd: number;
+  try {
+    if (!isAbsolute(path) || !statSync(path).isFile()) return null;
+    fd = openSync(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const chunk = Buffer.alloc(READ_SCAN_CHUNK);
+    let line = 1, bytes = 0, used = 0, taken = 0;
+    for (let pos = 0, n = 0; pos < READ_SCAN_BYTES; pos += n) {
+      n = readSync(fd, chunk, 0, chunk.length, pos);
+      if (n === 0) return null;   // the file ended within the bound
+      const view = chunk.subarray(0, n);
+      for (let i = 0; i < n;) {
+        const nl = view.indexOf(10, i);
+        bytes += (nl === -1 ? n : nl) - i;
+        if (line >= first && used + printedBytes(line, bytes) > READ_BYTE_BOUND) {
+          return taken ? { lines: taken } : { hugeLine: line };
+        }
+        if (nl === -1) break;
+        if (line >= first) {
+          used += printedBytes(line, bytes);
+          if (++taken === want) return null;
+        }
+        line++;
+        bytes = 0;
+        i = nl + 1;
+      }
+    }
+    return null;   // the window lies past READ_SCAN_BYTES
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** A read the bridge answers itself: the read's error, naming the route (BridgeAnswer). */
+function readError(a: ReadArgs, error: string): BridgeAnswer {
+  return { answer: [{ case: "readResult", value: create(ReadResultSchema, {
+    result: { case: "error", value: create(ReadErrorSchema, { path: a.path, error }) },
+  }) }] };
 }
 
 /**
- * What the bridge adds to a read READ_BOUND cut: the line it stopped at and
- * the Shell route to the rest. Claude Code's Read prints "N<tab>text" per
- * line and no total, so the note names `wc -l` rather than a count; a read
- * that ended before the bound gets nothing.
+ * A native read as the caller's Read, or as the bridge's own answer when
+ * Read cannot do it within the bounds: a read from the end (Read counts from
+ * the start, and marking the first lines as the last would be the wrong
+ * slice as a success), or a line that alone passes READ_BYTE_BOUND (Read
+ * cannot read part of a line). Each is that one request's error naming the
+ * Shell route, never a refusal of the tool.
  */
-function boundNote(a: ReadArgs, w: ReadWindow, text: string): string {
-  if (!w.capped) return "";
-  const lines = [...text.matchAll(/^ *(\d+)\t/gm)];
-  if (lines.length < w.limit) return "";
-  const last = Number(lines.at(-1)![1]);
+function readPlan(a: ReadArgs): CallerArgs | BridgeAnswer {
+  const r = readRange(a);
   const file = shellWord(a.path);
-  const rest = `find lines with git grep -n PATTERN ${file}, and count them with wc -l ${file}.]`;
-  return w.fromEnd
-    ? `\n\n[The caller's Read cannot start from the end of a file, so this read shows the first ${READ_BOUND} lines. ` +
-      `With the Shell tool, read the last ${w.fromEnd} with tail -n ${w.fromEnd} ${file}, ${rest}`
-    : `\n\n[This read stops at line ${last}: the bridge brings at most ${READ_BOUND} lines of a file into the caller's context per read, ` +
-      `and the file may go on. With the Shell tool, read the next lines with sed -n '${last + 1},${last + READ_BOUND}p' ${file}, ${rest}`;
+  if (r.offset !== undefined && r.offset < 0) {
+    const n = -r.offset;
+    trace(`native readArgs asks for the last ${n} lines: answered with the tail route`);
+    return readError(a, `Reading from the end of a file is not available here: the caller's Read counts lines from the start. ` +
+      `With the Shell tool, read the last ${n} lines with tail -n ${n} ${file}${r.limit && r.limit < n ? ` | head -n ${r.limit}` : ""}, ` +
+      `and count all of them with wc -l ${file}.`);
+  }
+  const first = Math.max(r.offset ?? 1, 1);
+  const fit = fitToBytes(a.path, first, readWant(r));
+  if (fit && "hugeLine" in fit) {
+    const n = fit.hugeLine;
+    trace(`native readArgs line ${n} passes ${READ_BYTE_BOUND} bytes: answered with the Shell route`);
+    return readError(a, `Line ${n} of ${a.path} is longer than the ${READ_BYTE_BOUND} bytes one read brings into the caller's context, ` +
+      `so it was not read. With the Shell tool, read it in parts with sed -n '${n}p' ${file} | cut -b 1-${READ_BYTE_BOUND}, ` +
+      `then cut -b ${READ_BYTE_BOUND + 1}-${2 * READ_BYTE_BOUND} and on, and the lines after it with sed -n '${n + 1},${n + READ_BOUND}p' ${file}.`);
+  }
+  const limit = fit ? fit.lines : readWant(r);
+  trace(`native readArgs ${r.offset !== undefined || r.limit !== undefined ? "carries a range" : "carries no range"}:`,
+    `Read offset=${first} limit=${limit}${fit ? ` (the lines that fit ${READ_BYTE_BOUND} bytes)` : ""}`);
+  return { need: { file_path: a.path, limit, ...(first > 1 && { offset: first }) } };
+}
+
+/**
+ * The client's Read output held to READ_BYTE_BOUND bytes on its way to
+ * Cursor: cut after its last whole line within the bound ("lines"), or, when
+ * its first line alone passes it, at the last whole character within it
+ * ("line").
+ */
+function capRead(text: string): { text: string; cut: "lines" | "line" | null } {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= READ_BYTE_BOUND) return { text, cut: null };
+  const nl = buf.lastIndexOf(10, READ_BYTE_BOUND);
+  if (nl > 0) return { text: buf.subarray(0, nl).toString("utf8"), cut: "lines" };
+  let end = READ_BYTE_BOUND;
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+  return { text: buf.subarray(0, end).toString("utf8"), cut: "line" };
+}
+
+/**
+ * What the bridge adds to a read a bound stopped: where it stopped, which
+ * bound stopped it, and the Shell route to the rest. Claude Code's Read
+ * prints "N<tab>text" per line and no total, so the note names `wc -l`
+ * rather than a count. A read that got every line it asked for gets nothing.
+ */
+function readNote(a: ReadArgs, r: ReadRange, limit: number, text: string, cut: "lines" | "line" | null): string {
+  const lines = [...text.matchAll(/^ *(\d+)\t/gm)];
+  const file = shellWord(a.path);
+  const find = `find lines with git grep -n PATTERN ${file}, and count them with wc -l ${file}.]`;
+  const bytes = `the ${READ_BYTE_BOUND} bytes the bridge brings per read`;
+  if (cut === "line" && lines[0]) {
+    const n = Number(lines[0][1]);
+    const held = utf8Bytes(text.slice(lines[0].index! + lines[0][0].length));
+    return `\n\n[This read stops partway through line ${n}: it holds the first ${held} bytes of that line, all ${bytes} allow. ` +
+      `With the Shell tool, read more of it with sed -n '${n}p' ${file} | cut -b ${held + 1}-${held + READ_BYTE_BOUND}, ` +
+      `the lines after it with sed -n '${n + 1},${n + READ_BOUND}p' ${file}, ${find}`;
+  }
+  const last = Number(lines.at(-1)?.[1] ?? 0);
+  if (cut && !last) return `\n\n[This read was cut to ${bytes}. With the Shell tool, ${find}`;
+  const why = cut ? `the text was cut to ${bytes}`
+    : lines.length < limit || limit >= (r.limit ?? Infinity) ? null
+    : limit < readWant(r) ? `the next line would pass ${bytes}`
+    : `the bridge brings at most ${READ_BOUND} lines per read`;
+  if (!why) return "";
+  return `\n\n[This read stops at line ${last}: ${why}, and the file may go on. With the Shell tool, ` +
+    `read the next lines with sed -n '${last + 1},${last + READ_BOUND}p' ${file}, ${find}`;
 }
 
 /**
@@ -1761,35 +1898,31 @@ function boundNote(a: ReadArgs, w: ReadWindow, text: string): string {
  * each is destructive or has no caller tool whose output gives its result
  * honestly. A read maps to Read only, never to Bash cat: a caller that
  * registered Bash but no Read chose that, and the refusal names Bash. A read
- * goes out with a limit (readWindow), so a Read whose schema takes none keeps
+ * goes out with a limit (readPlan), so a Read whose schema takes none keeps
  * the refusal rather than bring a whole file into the caller's context.
  */
 const NATIVE_ROUTES: { [C in NativeCase]: NativeRoute<ExecArgs<C>> } = {
   readArgs: {
     tool: "Read",
     carriesText: true,
-    call(a) {
-      const w = readWindow(a);
-      trace(`native readArgs ${w.ranged ? "carries a range" : "carries no range"}:`,
-        `Read offset=${w.offset ?? 1} limit=${w.limit}${w.fromEnd ? ` (asked the last ${w.fromEnd})` : ""}`);
-      return { need: { file_path: a.path, limit: w.limit, ...(w.offset !== undefined && { offset: w.offset }) } };
-    },
-    answer(a, out, note) {
+    call: readPlan,
+    answer(a, out, note, sent) {
       const o = outcome(out);
       if (!o.ok) {
         const error = create(ReadErrorSchema, { path: a.path, error: o.why + note });
         return [{ case: "readResult", value: create(ReadResultSchema, { result: { case: "error", value: error } }) }];
       }
-      const w = readWindow(a);
-      const cut = boundNote(a, w, o.text);
+      const r = readRange(a);
+      const { text, cut } = capRead(o.text);
+      const more = readNote(a, r, Number(sent.limit), text, cut);
       const success = create(ReadSuccessSchema, {
-        path: a.path, totalLines: lineCount(o.text), truncated: cut !== "", output: { case: "content", value: o.text + cut + note },
+        path: a.path, totalLines: lineCount(text), truncated: more !== "", output: { case: "content", value: text + more + note },
       });
       // Cursor's CLI sets range_applied exactly when it cut the content to
       // the read's range, so Cursor does not cut those lines again. A ranged
       // Read's output is already those lines; a read with no range has none
       // to apply, and goes out without it as the CLI's does.
-      if (w.ranged) {
+      if (r.offset !== undefined || r.limit !== undefined) {
         success.$unknown = [{
           no: READ_RANGE_APPLIED_FIELD, wireType: WireType.Varint, data: new BinaryWriter().bool(true).finish(),
         }];
@@ -1916,14 +2049,22 @@ function fitSchema(tool: McpToolDefinition, args: CallerArgs): Record<string, un
   return (Array.isArray(required) ? required : []).every((k) => k in out) ? out : null;
 }
 
-/** A native exec as the caller tool call that does its job, or null when it stays refused. */
-function translateNative(execMsg: ExecServerMessage, mcpTools: McpToolDefinition[]): PendingExec | null {
+/**
+ * A native exec as the caller tool call that does its job; as the native's
+ * own answer frames when the bridge answers it itself (BridgeAnswer); or
+ * null when it stays refused.
+ */
+function translateNative(execMsg: ExecServerMessage, mcpTools: McpToolDefinition[]): PendingExec | Buffer[] | null {
   const { case: c, value } = execMsg.message;
   if (!c || !Object.hasOwn(NATIVE_ROUTES, c)) return null;
   const route = routeOf(c as NativeCase);
   const tool = mcpTools.find((t) => (t.toolName || t.name) === route.tool);
   if (!tool) return null;
   const call = route.call(value as NativeArgs);
+  if (call && "answer" in call) {
+    trace(`native ${c} is answered by the bridge, with no call to the caller's ${route.tool}`);
+    return answerFrames(route, { id: execMsg.id, execId: execMsg.execId }, call.answer);
+  }
   const args = call && fitSchema(tool, call);
   if (!args) return null;
   const cursorToolCallId = (value as NativeArgs).toolCallId || crypto.randomUUID();
@@ -1939,14 +2080,19 @@ function translateNative(execMsg: ExecServerMessage, mcpTools: McpToolDefinition
   };
 }
 
-/** Cursor's answer to a translated native: its own result, then streamClose when it streams. */
+/** Cursor's answer to a translated native: its own result for the client's output. */
 function nativeFrames(exec: PendingExec, out: string | undefined, note: string): Buffer[] {
   const route = routeOf(exec.native!.case);
-  const target = { id: exec.execMsgId, execId: exec.execId };
-  const frames = route.answer(exec.native!.args, out, note).map((a) => execClientFrame(target, a.case, a.value));
+  const sent = JSON.parse(exec.decodedArgs) as Record<string, unknown>;
+  return answerFrames(route, { id: exec.execMsgId, execId: exec.execId }, route.answer(exec.native!.args, out, note, sent));
+}
+
+/** A native's answers as frames to Cursor, then streamClose when it streams. */
+function answerFrames(route: NativeRoute<NativeArgs>, target: { id: number; execId: string }, answers: ExecAnswer[]): Buffer[] {
+  const frames = answers.map((a) => execClientFrame(target, a.case, a.value));
   if (!route.streamed) return frames;
   const control = create(ExecClientControlMessageSchema, {
-    message: { case: "streamClose", value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }) },
+    message: { case: "streamClose", value: create(ExecClientStreamCloseSchema, { id: target.id }) },
   });
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "execClientControlMessage", value: control },
