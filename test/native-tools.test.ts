@@ -14,8 +14,20 @@
 // native exec whose caller tool is registered now reaches the client as that
 // tool's call, and the client's output reaches Cursor as the native's own
 // result. Natives with no honest caller equivalent keep the refusal.
+//
+// helm arm (2026-09-29): A NATIVE READ BRINGS A BOUNDED NUMBER OF LINES INTO
+// THE CLIENT'S CONTEXT. MEASURED on the cursor seat's transcript: the model
+// said it would read "in small slices", and each of Cursor's reads reached
+// Claude Code as a Read with only file_path, so Claude Code read the whole
+// file (a 100 KB module twice in 2 s, then 53 KB and 99 KB more). The
+// conversation went from about 90k to 155k tokens in five seconds and
+// compacted, every three minutes. Cursor's CLI proto carries the read's own
+// offset and limit on ReadArgs fields 4 and 5, which the vendored proto
+// predates: they go out as Read's offset and limit, never more than the
+// bound, and a read the bound cut ends with the route to the rest.
 import { afterEach, describe, expect, test } from "bun:test";
 import { create, fromBinary, fromJson, toBinary } from "@bufbuild/protobuf";
+import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
   AgentClientMessageSchema,
@@ -163,6 +175,33 @@ function resultOf(sent: Array<{ case: string; value: any }>, execId: string) {
   return m!.value.message as { case: string; value: any };
 }
 
+/** READ_BOUND in src/proxy.ts: the most lines one native read brings into the client's context. */
+const BOUND = 400;
+
+/**
+ * A read as Cursor's server sends it: its offset (field 4) and limit
+ * (field 5) are fields of Cursor's CLI proto that the vendored proto
+ * predates, so the bridge decodes them as unknown fields.
+ */
+function readExec(id: number, path: string, range: { offset?: number; limit?: number } = {}): ExecServerMessage {
+  const extra = new BinaryWriter();
+  if (range.offset !== undefined) extra.tag(4, WireType.Varint).int32(range.offset);
+  if (range.limit !== undefined) extra.tag(5, WireType.Varint).uint32(range.limit);
+  const known = toBinary(ReadArgsSchema, create(ReadArgsSchema, { path, toolCallId: `call-${id}` }));
+  return exec(id, "readArgs", fromBinary(ReadArgsSchema, new Uint8Array([...known, ...extra.finish()])));
+}
+
+/** Claude Code's Read output for lines `from`..`to`: "N<tab>text" per line. */
+function numbered(from: number, to: number): string {
+  return Array.from({ length: to - from + 1 }, (_, i) => `${from + i}\tline ${from + i}`).join("\n");
+}
+
+/** ReadSuccess.range_applied (field 8, unknown to the vendored proto): the bytes it carries, or undefined. */
+function rangeApplied(success: { $unknown?: Array<{ no: number; data: Uint8Array }> }): number[] | undefined {
+  const f = success.$unknown?.find((u) => u.no === 8);
+  return f && [...f.data];
+}
+
 const NO_ROUTE = `Cursor's own tool is refused in this environment, so do not stop here: call a tool on MCP server "opencode" with CallDynamicTool (namespace "opencode"); GetDynamicTools lists them with their schemas.`;
 const BASH_ROUTE = `Cursor's own tool is refused in this environment, so do not stop here: call the MCP tool "Bash" on server "opencode" with CallDynamicTool (namespace "opencode", toolName "Bash"); GetDynamicTools gives its schema.`;
 
@@ -282,7 +321,7 @@ describe("native tools the caller can run are run as the caller's tool", () => {
     const s = await readSse(a.resp);
     expect(s.finish).toBe("tool_calls");
     expect(s.toolCalls.map((c) => [c.id, c.name, JSON.parse(c.arguments)]))
-      .toEqual([["call-r1_fc_r1", "Read", { file_path: "/tmp/notes.txt" }]]);
+      .toEqual([["call-r1_fc_r1", "Read", { file_path: "/tmp/notes.txt", limit: BOUND }]]);
     expect(a.fb.writes.length).toBe(0);
     expect(__test.pausedRuns.get("call-r1_fc_r1")).toBe(a.run as never);
   });
@@ -506,5 +545,110 @@ describe("native tools the caller can run are run as the caller's tool", () => {
     expect(calls.map((c) => c.name)).toEqual(["Read", "Bash"]);
     expect(resultOf(sent, "exec-1").case).toBe("readResult");
     expect(resultOf(sent, "exec-2").case).toBe("mcpResult");
+  });
+});
+
+describe("a native read brings at most the bound's lines into the client's context", () => {
+  test("a read with no range reaches the client as Read with the bound as its limit", () => {
+    const { sent, calls, args } = handled(readExec(9, "/tmp/big.py"), tools("Read"));
+    expect(sent.length).toBe(0);
+    expect(calls.map((c) => c.toolName)).toEqual(["Read"]);
+    expect(args).toEqual([{ file_path: "/tmp/big.py", limit: BOUND }]);
+  });
+
+  test("the read's own range reaches the client as Read's offset and limit, never over the bound", () => {
+    const read = (range: { offset?: number; limit?: number }) => handled(readExec(9, "/tmp/big.py", range), tools("Read")).args;
+    expect(read({ offset: 1200, limit: 80 })).toEqual([{ file_path: "/tmp/big.py", offset: 1200, limit: 80 }]);
+    expect(read({ offset: 1200 })).toEqual([{ file_path: "/tmp/big.py", offset: 1200, limit: BOUND }]);
+    expect(read({ offset: 1200, limit: 5000 })).toEqual([{ file_path: "/tmp/big.py", offset: 1200, limit: BOUND }]);
+    expect(read({ limit: 30 })).toEqual([{ file_path: "/tmp/big.py", limit: 30 }]);
+    // Line 1 (or Cursor's 0, which its CLI reads as line 1) needs no offset.
+    expect(read({ offset: 1, limit: 30 })).toEqual([{ file_path: "/tmp/big.py", limit: 30 }]);
+    expect(read({ offset: 0, limit: 30 })).toEqual([{ file_path: "/tmp/big.py", limit: 30 }]);
+    // A negative offset counts from the end, which Read cannot: the first lines, bounded.
+    expect(read({ offset: -50 })).toEqual([{ file_path: "/tmp/big.py", limit: BOUND }]);
+  });
+
+  test("a Read whose schema takes no limit is refused and named, never called unbounded", () => {
+    const mcp = [withSchema("Read", { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] })];
+    const { sent, calls } = handled(readExec(9, "/tmp/big.py"), mcp);
+    expect(calls).toEqual([]);
+    const read = clientMessage(sent[0]!).value.message;
+    expect(read.value.result.case).toBe("rejected");
+    expect(read.value.result.value.reason).toContain('"Read"');
+  });
+
+  test("a small file reads whole exactly as today: its text, no note, not truncated, no range applied", async () => {
+    const text = numbered(1, 3);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/small.py")], [text]);
+    const ok = resultOf(sent, "exec-9").value.result;
+    expect(ok.case).toBe("success");
+    expect(ok.value.output).toEqual({ case: "content", value: text });
+    expect([ok.value.totalLines, ok.value.truncated]).toEqual([3, false]);
+    expect(rangeApplied(ok.value)).toBeUndefined();
+  });
+
+  test("a read the bound cut reaches Cursor with the line it stopped at and the Shell route to the rest", async () => {
+    const text = numbered(1, BOUND);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py")], [text]);
+    const ok = resultOf(sent, "exec-9").value.result.value;
+    const content: string = ok.output.value;
+    expect(content.startsWith(text)).toBe(true);
+    const note = content.slice(text.length);
+    expect(note).toContain(`stops at line ${BOUND}`);
+    expect(note).toContain(`at most ${BOUND} lines`);
+    expect(note).toContain(`sed -n '${BOUND + 1},${2 * BOUND}p' '/tmp/big.py'`);
+    expect(note).toContain("git grep -n PATTERN '/tmp/big.py'");
+    expect(note).toContain("wc -l '/tmp/big.py'");
+    expect(note).toContain("Shell");
+    expect(ok.truncated).toBe(true);
+    // No range was asked for, so there is none Cursor could apply again.
+    expect(rangeApplied(ok)).toBeUndefined();
+  });
+
+  test("a read of its own range gets exactly those lines, marked applied so Cursor does not cut them again", async () => {
+    const text = numbered(1200, 1279);
+    const { calls, sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py", { offset: 1200, limit: 80 })], [text]);
+    expect(calls.map((c) => JSON.parse(c.arguments))).toEqual([{ file_path: "/tmp/big.py", offset: 1200, limit: 80 }]);
+    const ok = resultOf(sent, "exec-9").value.result.value;
+    expect(ok.output.value).toBe(text);
+    expect(ok.truncated).toBe(false);
+    expect(rangeApplied(ok)).toEqual([1]);
+  });
+
+  test("a range longer than the bound stops at the bound, with the next lines named", async () => {
+    const text = numbered(1200, 1200 + BOUND - 1);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py", { offset: 1200, limit: 1000 })], [text]);
+    const ok = resultOf(sent, "exec-9").value.result.value;
+    expect(ok.output.value).toContain(`stops at line ${1200 + BOUND - 1}`);
+    expect(ok.output.value).toContain(`sed -n '${1200 + BOUND},${1200 + 2 * BOUND - 1}p' '/tmp/big.py'`);
+    expect(ok.truncated).toBe(true);
+    expect(rangeApplied(ok)).toEqual([1]);
+  });
+
+  test("a range that ends inside the bound, or a file that ends first, gets no note", async () => {
+    const short = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py", { offset: 10, limit: 1000 })], [numbered(10, 60)]);
+    const ok = resultOf(short.sent, "exec-9").value.result.value;
+    expect(ok.output.value).toBe(numbered(10, 60));
+    expect(ok.truncated).toBe(false);
+  });
+
+  test("a read from the end shows the first lines, bounded, and names tail for the last ones", async () => {
+    const text = numbered(1, BOUND);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py", { offset: -50 })], [text]);
+    const ok = resultOf(sent, "exec-9").value.result.value;
+    expect(ok.output.value.startsWith(text)).toBe(true);
+    expect(ok.output.value).toContain("tail -n 50 '/tmp/big.py'");
+    expect(ok.truncated).toBe(true);
+    expect(rangeApplied(ok)).toEqual([1]);
+  });
+
+  test("the note comes before text sent with the results, which still rides the read", async () => {
+    const text = numbered(1, BOUND);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py")], [text], "stop and summarize");
+    const content: string = resultOf(sent, "exec-9").value.result.value.output.value;
+    expect(content.endsWith("\n\n<user_message>\nstop and summarize\n</user_message>")).toBe(true);
+    expect(content.indexOf("sed -n")).toBeGreaterThan(text.length);
+    expect(content.indexOf("sed -n")).toBeLessThan(content.indexOf("<user_message>"));
   });
 });
