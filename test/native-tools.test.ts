@@ -25,9 +25,22 @@
 // offset and limit on ReadArgs fields 4 and 5, which the vendored proto
 // predates: they go out as Read's offset and limit, never more than the
 // bound, and a read the bound cut ends with the route to the rest.
-import { afterEach, describe, expect, test } from "bun:test";
+//
+// Review of that arm: the line bound alone still let a 339-line, 99 KB page
+// or one huge line through whole, and a negative offset came back as the
+// file's first lines marked range_applied, the wrong slice as a success. The
+// client's Read output is what fills its context, and the bridge cannot
+// shrink what the client already read, so the bridge measures the file on
+// disk and asks for no more lines than fit its byte bound; the text it
+// returns to Cursor is held to that bound as well; a line that alone passes
+// the bound, and a read from the end, are each answered with a read error
+// naming the Shell route, with no client call.
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { create, fromBinary, fromJson, toBinary } from "@bufbuild/protobuf";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
   AgentClientMessageSchema,
@@ -138,6 +151,7 @@ afterEach(() => {
   for (const fb of live.splice(0)) fb.close(0);
   __test.pausedRuns.clear();
 });
+afterAll(() => rmSync(DIR, { recursive: true, force: true }));
 
 /** A live run over a fake bridge whose request registered `mcp`. */
 function started(mcp: McpToolDefinition[]) {
@@ -177,6 +191,30 @@ function resultOf(sent: Array<{ case: string; value: any }>, execId: string) {
 
 /** READ_BOUND in src/proxy.ts: the most lines one native read brings into the client's context. */
 const BOUND = 400;
+/** READ_BYTE_BOUND in src/proxy.ts: the most bytes of a file's text one native read brings in. */
+const BYTES = 24000;
+
+/** Real files for the reads the bridge measures on disk, and a path that is not there. */
+const DIR = mkdtempSync(join(tmpdir(), "bridge-read-bound-"));
+const ABSENT = join(DIR, "absent.py");
+/** A page of long lines: 339 lines of 291 characters, 99 KB, like the seat's WEB.md. */
+const PAGE = join(DIR, "page.md");
+writeFileSync(PAGE, Array.from({ length: 339 }, () => "p".repeat(291) + "\n").join(""));
+/** One line of 100,000 bytes, then a short one. */
+const ONE_LINE = join(DIR, "one-line.json");
+writeFileSync(ONE_LINE, "x".repeat(100_000) + "\nshort\n");
+const SHORT = join(DIR, "short.py");
+writeFileSync(SHORT, Array.from({ length: 10 }, (_, i) => `line ${i + 1}\n`).join(""));
+const LONG = join(DIR, "long.py");
+writeFileSync(LONG, Array.from({ length: 1000 }, (_, i) => `line ${i + 1}\n`).join(""));
+
+/** Claude Code's Read output for `path`'s lines `from`..`to`, read off the disk. */
+function printed(path: string, from: number, to: number): string {
+  const lines = readFileSync(path, "utf8").split("\n");
+  return Array.from({ length: to - from + 1 }, (_, i) => `${from + i}\t${lines[from + i - 1]}`).join("\n");
+}
+
+const utf8 = (s: string): number => Buffer.byteLength(s, "utf8");
 
 /**
  * A read as Cursor's server sends it: its offset (field 4) and limit
@@ -548,30 +586,28 @@ describe("native tools the caller can run are run as the caller's tool", () => {
   });
 });
 
-describe("a native read brings at most the bound's lines into the client's context", () => {
-  test("a read with no range reaches the client as Read with the bound as its limit", () => {
-    const { sent, calls, args } = handled(readExec(9, "/tmp/big.py"), tools("Read"));
+describe("a native read brings at most the bound's lines and bytes into the client's context", () => {
+  test("a read with no range reaches the client as Read with the line bound as its limit", () => {
+    const { sent, calls, args } = handled(readExec(9, ABSENT), tools("Read"));
     expect(sent.length).toBe(0);
     expect(calls.map((c) => c.toolName)).toEqual(["Read"]);
-    expect(args).toEqual([{ file_path: "/tmp/big.py", limit: BOUND }]);
+    expect(args).toEqual([{ file_path: ABSENT, limit: BOUND }]);
   });
 
   test("the read's own range reaches the client as Read's offset and limit, never over the bound", () => {
-    const read = (range: { offset?: number; limit?: number }) => handled(readExec(9, "/tmp/big.py", range), tools("Read")).args;
-    expect(read({ offset: 1200, limit: 80 })).toEqual([{ file_path: "/tmp/big.py", offset: 1200, limit: 80 }]);
-    expect(read({ offset: 1200 })).toEqual([{ file_path: "/tmp/big.py", offset: 1200, limit: BOUND }]);
-    expect(read({ offset: 1200, limit: 5000 })).toEqual([{ file_path: "/tmp/big.py", offset: 1200, limit: BOUND }]);
-    expect(read({ limit: 30 })).toEqual([{ file_path: "/tmp/big.py", limit: 30 }]);
+    const read = (range: { offset?: number; limit?: number }) => handled(readExec(9, ABSENT, range), tools("Read")).args;
+    expect(read({ offset: 1200, limit: 80 })).toEqual([{ file_path: ABSENT, offset: 1200, limit: 80 }]);
+    expect(read({ offset: 1200 })).toEqual([{ file_path: ABSENT, offset: 1200, limit: BOUND }]);
+    expect(read({ offset: 1200, limit: 5000 })).toEqual([{ file_path: ABSENT, offset: 1200, limit: BOUND }]);
+    expect(read({ limit: 30 })).toEqual([{ file_path: ABSENT, limit: 30 }]);
     // Line 1 (or Cursor's 0, which its CLI reads as line 1) needs no offset.
-    expect(read({ offset: 1, limit: 30 })).toEqual([{ file_path: "/tmp/big.py", limit: 30 }]);
-    expect(read({ offset: 0, limit: 30 })).toEqual([{ file_path: "/tmp/big.py", limit: 30 }]);
-    // A negative offset counts from the end, which Read cannot: the first lines, bounded.
-    expect(read({ offset: -50 })).toEqual([{ file_path: "/tmp/big.py", limit: BOUND }]);
+    expect(read({ offset: 1, limit: 30 })).toEqual([{ file_path: ABSENT, limit: 30 }]);
+    expect(read({ offset: 0, limit: 30 })).toEqual([{ file_path: ABSENT, limit: 30 }]);
   });
 
   test("a Read whose schema takes no limit is refused and named, never called unbounded", () => {
     const mcp = [withSchema("Read", { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] })];
-    const { sent, calls } = handled(readExec(9, "/tmp/big.py"), mcp);
+    const { sent, calls } = handled(readExec(9, ABSENT), mcp);
     expect(calls).toEqual([]);
     const read = clientMessage(sent[0]!).value.message;
     expect(read.value.result.case).toBe("rejected");
@@ -579,73 +615,155 @@ describe("a native read brings at most the bound's lines into the client's conte
   });
 
   test("a small file reads whole exactly as today: its text, no note, not truncated, no range applied", async () => {
-    const text = numbered(1, 3);
-    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/small.py")], [text]);
+    const text = printed(SHORT, 1, 10);
+    const { calls, sent } = await roundTrip(tools("Read"), [readExec(9, SHORT)], [text]);
+    expect(calls.map((c) => JSON.parse(c.arguments))).toEqual([{ file_path: SHORT, limit: BOUND }]);
     const ok = resultOf(sent, "exec-9").value.result;
     expect(ok.case).toBe("success");
     expect(ok.value.output).toEqual({ case: "content", value: text });
-    expect([ok.value.totalLines, ok.value.truncated]).toEqual([3, false]);
+    expect([ok.value.totalLines, ok.value.truncated]).toEqual([10, false]);
     expect(rangeApplied(ok.value)).toBeUndefined();
   });
 
-  test("a read the bound cut reaches Cursor with the line it stopped at and the Shell route to the rest", async () => {
-    const text = numbered(1, BOUND);
-    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py")], [text]);
+  test("a read the line bound cut reaches Cursor with the line it stopped at and the Shell route to the rest", async () => {
+    const text = printed(LONG, 1, BOUND);
+    const { calls, sent } = await roundTrip(tools("Read"), [readExec(9, LONG)], [text]);
+    expect(calls.map((c) => JSON.parse(c.arguments))).toEqual([{ file_path: LONG, limit: BOUND }]);
     const ok = resultOf(sent, "exec-9").value.result.value;
     const content: string = ok.output.value;
     expect(content.startsWith(text)).toBe(true);
     const note = content.slice(text.length);
-    expect(note).toContain(`stops at line ${BOUND}`);
-    expect(note).toContain(`at most ${BOUND} lines`);
-    expect(note).toContain(`sed -n '${BOUND + 1},${2 * BOUND}p' '/tmp/big.py'`);
-    expect(note).toContain("git grep -n PATTERN '/tmp/big.py'");
-    expect(note).toContain("wc -l '/tmp/big.py'");
+    expect(note).toContain(`stops at line ${BOUND}: the bridge brings at most ${BOUND} lines per read`);
+    expect(note).toContain(`sed -n '${BOUND + 1},${2 * BOUND}p' '${LONG}'`);
+    expect(note).toContain(`git grep -n PATTERN '${LONG}'`);
+    expect(note).toContain(`wc -l '${LONG}'`);
     expect(note).toContain("Shell");
     expect(ok.truncated).toBe(true);
     // No range was asked for, so there is none Cursor could apply again.
     expect(rangeApplied(ok)).toBeUndefined();
   });
 
+  // F1: 339 lines of 291 characters. Read prints "N<tab>text<newline>", so
+  // lines 1-9 cost 294 bytes and lines 10-99 cost 295: 9 * 294 + 72 * 295 =
+  // 23,886 fits 24,000, and an 82nd line (24,181) does not.
+  test("a page of long lines is read only as far as the byte bound, so the client reads 81 of its 339 lines", async () => {
+    const { calls, sent } = await roundTrip(tools("Read"), [readExec(9, PAGE)], [printed(PAGE, 1, 81)]);
+    expect(calls.map((c) => JSON.parse(c.arguments))).toEqual([{ file_path: PAGE, limit: 81 }]);
+    const content: string = resultOf(sent, "exec-9").value.result.value.output.value;
+    const text = printed(PAGE, 1, 81);
+    expect(utf8(text)).toBeLessThanOrEqual(BYTES);
+    expect(content.startsWith(text)).toBe(true);
+    const note = content.slice(text.length);
+    expect(note).toContain(`stops at line 81: the next line would pass the ${BYTES} bytes the bridge brings per read`);
+    expect(note).toContain(`sed -n '82,${81 + BOUND}p' '${PAGE}'`);
+    expect(resultOf(sent, "exec-9").value.result.value.truncated).toBe(true);
+  });
+
+  test("a window the page ends inside keeps the line limit, and gets no note", async () => {
+    const { calls, sent } = await roundTrip(tools("Read"), [readExec(9, PAGE, { offset: 320 })], [printed(PAGE, 320, 339)]);
+    expect(calls.map((c) => JSON.parse(c.arguments))).toEqual([{ file_path: PAGE, offset: 320, limit: BOUND }]);
+    const ok = resultOf(sent, "exec-9").value.result.value;
+    expect(ok.output.value).toBe(printed(PAGE, 320, 339));
+    expect(ok.truncated).toBe(false);
+    expect(rangeApplied(ok)).toEqual([1]);
+  });
+
+  test("a line that alone passes the byte bound is never read: Cursor gets a read error naming the Shell route", () => {
+    const { sent, calls } = handled(readExec(9, ONE_LINE), tools("Read"));
+    expect(calls).toEqual([]);
+    expect(sent.length).toBe(1);
+    const read = clientMessage(sent[0]!).value;
+    expect([read.id, read.execId, read.message.case]).toEqual([9, "exec-9", "readResult"]);
+    expect(read.message.value.result.case).toBe("error");
+    const error: string = read.message.value.result.value.error;
+    expect(error).toContain(`Line 1 of ${ONE_LINE} is longer than the ${BYTES} bytes`);
+    expect(error).toContain(`sed -n '1p' '${ONE_LINE}' | cut -b 1-${BYTES}`);
+    expect(error).toContain("Shell");
+    // The line after it reads as usual.
+    expect(handled(readExec(10, ONE_LINE, { offset: 2 }), tools("Read")).args)
+      .toEqual([{ file_path: ONE_LINE, offset: 2, limit: BOUND }]);
+  });
+
+  test("text the bridge could not measure is held to the byte bound on its way to Cursor, cut at a whole line", async () => {
+    const line = (n: number) => `${n}\t${"w".repeat(300)}`;
+    const text = Array.from({ length: 100 }, (_, i) => line(i + 1)).join("\n");
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, ABSENT)], [text]);
+    const ok = resultOf(sent, "exec-9").value.result.value;
+    const content: string = ok.output.value;
+    const at = content.indexOf("\n\n[");
+    const kept = content.slice(0, at);
+    expect(utf8(kept)).toBeLessThanOrEqual(BYTES);
+    const last = kept.split("\n").length;   // whole lines 1..last: each 303 to 305 bytes
+    expect(kept).toBe(Array.from({ length: last }, (_, i) => line(i + 1)).join("\n"));
+    expect(utf8(kept + "\n" + line(last + 1))).toBeGreaterThan(BYTES);
+    expect(content.slice(at)).toContain(`stops at line ${last}: the text was cut to the ${BYTES} bytes the bridge brings per read`);
+    expect(content.slice(at)).toContain(`sed -n '${last + 1},${last + BOUND}p' '${ABSENT}'`);
+    expect(ok.truncated).toBe(true);
+  });
+
+  test("one unmeasured line past the byte bound reaches Cursor cut at a character, with the bytes it holds named", async () => {
+    const text = `1\t${"é".repeat(30_000)}`;   // 60,000 bytes of text
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, ABSENT)], [text]);
+    const content: string = resultOf(sent, "exec-9").value.result.value.output.value;
+    const at = content.indexOf("\n\n[");
+    const kept = content.slice(0, at);
+    expect(utf8(kept)).toBeLessThanOrEqual(BYTES);
+    expect(kept).not.toContain("�");
+    const held = utf8(kept) - utf8("1\t");
+    expect(held).toBe(BYTES - 2);   // "1<tab>" plus 11,999 two-byte characters
+    expect(content.slice(at)).toContain(`stops partway through line 1: it holds the first ${held} bytes of that line`);
+    expect(content.slice(at)).toContain(`sed -n '1p' '${ABSENT}' | cut -b ${held + 1}-${held + BYTES}`);
+  });
+
   test("a read of its own range gets exactly those lines, marked applied so Cursor does not cut them again", async () => {
-    const text = numbered(1200, 1279);
-    const { calls, sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py", { offset: 1200, limit: 80 })], [text]);
-    expect(calls.map((c) => JSON.parse(c.arguments))).toEqual([{ file_path: "/tmp/big.py", offset: 1200, limit: 80 }]);
+    const text = printed(LONG, 200, 279);
+    const { calls, sent } = await roundTrip(tools("Read"), [readExec(9, LONG, { offset: 200, limit: 80 })], [text]);
+    expect(calls.map((c) => JSON.parse(c.arguments))).toEqual([{ file_path: LONG, offset: 200, limit: 80 }]);
     const ok = resultOf(sent, "exec-9").value.result.value;
     expect(ok.output.value).toBe(text);
     expect(ok.truncated).toBe(false);
     expect(rangeApplied(ok)).toEqual([1]);
   });
 
-  test("a range longer than the bound stops at the bound, with the next lines named", async () => {
-    const text = numbered(1200, 1200 + BOUND - 1);
-    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py", { offset: 1200, limit: 1000 })], [text]);
+  test("a range longer than the line bound stops at the bound, with the next lines named", async () => {
+    const text = printed(LONG, 200, 200 + BOUND - 1);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, LONG, { offset: 200, limit: 700 })], [text]);
     const ok = resultOf(sent, "exec-9").value.result.value;
-    expect(ok.output.value).toContain(`stops at line ${1200 + BOUND - 1}`);
-    expect(ok.output.value).toContain(`sed -n '${1200 + BOUND},${1200 + 2 * BOUND - 1}p' '/tmp/big.py'`);
+    expect(ok.output.value).toContain(`stops at line ${200 + BOUND - 1}: the bridge brings at most ${BOUND} lines per read`);
+    expect(ok.output.value).toContain(`sed -n '${200 + BOUND},${200 + 2 * BOUND - 1}p' '${LONG}'`);
     expect(ok.truncated).toBe(true);
     expect(rangeApplied(ok)).toEqual([1]);
   });
 
-  test("a range that ends inside the bound, or a file that ends first, gets no note", async () => {
-    const short = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py", { offset: 10, limit: 1000 })], [numbered(10, 60)]);
-    const ok = resultOf(short.sent, "exec-9").value.result.value;
-    expect(ok.output.value).toBe(numbered(10, 60));
+  test("a range the file ends inside gets no note", async () => {
+    const text = printed(LONG, 990, 1000);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, LONG, { offset: 990, limit: 1000 })], [text]);
+    const ok = resultOf(sent, "exec-9").value.result.value;
+    expect(ok.output.value).toBe(text);
     expect(ok.truncated).toBe(false);
   });
 
-  test("a read from the end shows the first lines, bounded, and names tail for the last ones", async () => {
-    const text = numbered(1, BOUND);
-    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py", { offset: -50 })], [text]);
-    const ok = resultOf(sent, "exec-9").value.result.value;
-    expect(ok.output.value.startsWith(text)).toBe(true);
-    expect(ok.output.value).toContain("tail -n 50 '/tmp/big.py'");
-    expect(ok.truncated).toBe(true);
-    expect(rangeApplied(ok)).toEqual([1]);
+  // F2: Read counts lines from the start only, so a negative offset is never
+  // sent as the first lines: it is answered at once with a read error that
+  // names tail, whatever the file's length, and nothing reads as its tail.
+  test("a read from the end is answered with a read error naming tail, never the first lines as range_applied", () => {
+    for (const path of [SHORT, LONG, ABSENT]) {
+      const { sent, calls } = handled(readExec(9, path, { offset: -50 }), tools("Read"));
+      expect(calls).toEqual([]);
+      expect(sent.length).toBe(1);
+      const result = clientMessage(sent[0]!).value.message.value.result;
+      expect(result.case).toBe("error");
+      expect(result.value.path).toBe(path);
+      expect(result.value.error).toContain(`tail -n 50 '${path}'`);
+      expect(result.value.error).toContain("Shell");
+    }
+    const some = handled(readExec(9, LONG, { offset: -50, limit: 10 }), tools("Read"));
+    expect(clientMessage(some.sent[0]!).value.message.value.result.value.error).toContain(`tail -n 50 '${LONG}' | head -n 10`);
   });
 
   test("the note comes before text sent with the results, which still rides the read", async () => {
-    const text = numbered(1, BOUND);
-    const { sent } = await roundTrip(tools("Read"), [readExec(9, "/tmp/big.py")], [text], "stop and summarize");
+    const text = printed(LONG, 1, BOUND);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, LONG)], [text], "stop and summarize");
     const content: string = resultOf(sent, "exec-9").value.result.value.output.value;
     expect(content.endsWith("\n\n<user_message>\nstop and summarize\n</user_message>")).toBe(true);
     expect(content.indexOf("sed -n")).toBeGreaterThan(text.length);
