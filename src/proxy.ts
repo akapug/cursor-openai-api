@@ -10,7 +10,8 @@
  * - mcpArgs exec → pause stream, return tool_calls to caller
  * - Follow-up request with tool results → resume bridge with mcpResult
  * - A native exec (read, shell, grep, ...) whose caller tool is registered →
- *   that tool's call (translateNative), answered as the native (nativeFrames)
+ *   that tool's call (translateNative), answered as the native (nativeFrames);
+ *   a read brings at most READ_BOUND lines into the caller's context
  *
  * HTTP/2 transport is delegated to a Node child process (h2-bridge.mjs)
  * because Bun's node:http2 module is broken.
@@ -18,7 +19,7 @@
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { CURSOR_CLIENT_VERSION, getCursorModels } from "./models";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
-import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
+import { BinaryReader, BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -1669,26 +1670,131 @@ const GREP_READERS: Record<string, (text: string, a: GrepArgs) => GrepUnionResul
 const LS_END = "-- end of listing --";
 
 /**
+ * helm patch (2026-09-29): THE MOST LINES ONE OF CURSOR'S READS BRINGS INTO
+ * THE CALLER'S CONTEXT. MEASURED on the cursor seat's Claude Code
+ * transcript: each read went out as a Read with only file_path, so Claude
+ * Code read the whole file (a 100,627-character module twice within 2 s,
+ * then 53 KB and 99 KB more); the conversation went from about 90k to 155k
+ * tokens in five seconds and compacted, every three minutes. That module's
+ * code runs about 55 characters a line (1,836 lines), so 400 lines is about
+ * 22 KB, some 5,500 tokens by the bridge's bytes-over-four estimate: room
+ * for a function and its neighbours, and a dozen reads before a compaction
+ * where the whole file allowed two. A file of long lines (Markdown with a
+ * paragraph a line) carries more per line; Claude Code's own per-read cap
+ * stays the ceiling there.
+ */
+const READ_BOUND = 400;
+
+// agent.v1.ReadArgs.offset = 4 (int32) and .limit = 5 (uint32), and
+// ReadSuccess.range_applied = 8 (bool), from Cursor's CLI bundles
+// (2026.04.14, 2026.05.20): the vendored proto predates all three, so the
+// read's range arrives as unknown fields and range_applied goes out as one.
+const READ_OFFSET_FIELD = 4;
+const READ_LIMIT_FIELD = 5;
+const READ_RANGE_APPLIED_FIELD = 8;
+
+/** A varint field the vendored proto cannot name, read off the message's unknown fields. */
+function unknownVarint(m: ReadArgs, no: number, read: (r: BinaryReader) => number): number | undefined {
+  const f = m.$unknown?.find((u) => u.no === no && u.wireType === WireType.Varint);
+  return f && read(new BinaryReader(f.data));
+}
+
+/** The lines a native read goes out for (readWindow). */
+interface ReadWindow {
+  /** Read's offset: the first line, when that is past line 1. */
+  offset?: number;
+  /** Read's limit: the lines asked for, never more than READ_BOUND. */
+  limit: number;
+  /** The read named its lines, so the client's output is already the answer (range_applied). */
+  ranged: boolean;
+  /** READ_BOUND, not the read, set the limit, so output that reaches it may stop short. */
+  capped: boolean;
+  /** The lines from the end a negative offset asks for; Read cannot start there. */
+  fromEnd?: number;
+}
+
+/**
+ * A native read's lines, taken as Cursor's CLI executor takes them (the
+ * first line 1-based, 0 read as 1; a negative offset counts from the end,
+ * with that many lines unless a limit is given; no limit reads to the end),
+ * fitted to Read and to READ_BOUND. A read from the end becomes the first
+ * READ_BOUND lines: Read counts from the start only.
+ */
+function readWindow(a: ReadArgs): ReadWindow {
+  const offset = unknownVarint(a, READ_OFFSET_FIELD, (r) => r.int32());
+  const asked = unknownVarint(a, READ_LIMIT_FIELD, (r) => r.uint32()) || undefined;
+  const fromEnd = offset !== undefined && offset < 0 ? -offset : undefined;
+  const want = fromEnd ? Infinity : asked ?? Infinity;
+  return {
+    ...(offset !== undefined && offset > 1 && { offset }),
+    limit: Math.min(want, READ_BOUND),
+    ranged: offset !== undefined || asked !== undefined,
+    capped: want > READ_BOUND,
+    ...(fromEnd !== undefined && { fromEnd }),
+  };
+}
+
+/**
+ * What the bridge adds to a read READ_BOUND cut: the line it stopped at and
+ * the Shell route to the rest. Claude Code's Read prints "N<tab>text" per
+ * line and no total, so the note names `wc -l` rather than a count; a read
+ * that ended before the bound gets nothing.
+ */
+function boundNote(a: ReadArgs, w: ReadWindow, text: string): string {
+  if (!w.capped) return "";
+  const lines = [...text.matchAll(/^ *(\d+)\t/gm)];
+  if (lines.length < w.limit) return "";
+  const last = Number(lines.at(-1)![1]);
+  const file = shellWord(a.path);
+  const rest = `find lines with git grep -n PATTERN ${file}, and count them with wc -l ${file}.]`;
+  return w.fromEnd
+    ? `\n\n[The caller's Read cannot start from the end of a file, so this read shows the first ${READ_BOUND} lines. ` +
+      `With the Shell tool, read the last ${w.fromEnd} with tail -n ${w.fromEnd} ${file}, ${rest}`
+    : `\n\n[This read stops at line ${last}: the bridge brings at most ${READ_BOUND} lines of a file into the caller's context per read, ` +
+      `and the file may go on. With the Shell tool, read the next lines with sed -n '${last + 1},${last + READ_BOUND}p' ${file}, ${rest}`;
+}
+
+/**
  * Each native the bridge runs as a caller tool: the tool, its arguments, and
  * how the client's output becomes the native's own result. Natives not here
  * (delete, background shells, stdin writes, and the rest) keep the refusal:
  * each is destructive or has no caller tool whose output gives its result
  * honestly. A read maps to Read only, never to Bash cat: a caller that
- * registered Bash but no Read chose that, and the refusal names Bash.
+ * registered Bash but no Read chose that, and the refusal names Bash. A read
+ * goes out with a limit (readWindow), so a Read whose schema takes none keeps
+ * the refusal rather than bring a whole file into the caller's context.
  */
 const NATIVE_ROUTES: { [C in NativeCase]: NativeRoute<ExecArgs<C>> } = {
   readArgs: {
     tool: "Read",
     carriesText: true,
-    call: (a) => ({ need: { file_path: a.path } }),
+    call(a) {
+      const w = readWindow(a);
+      trace(`native readArgs ${w.ranged ? "carries a range" : "carries no range"}:`,
+        `Read offset=${w.offset ?? 1} limit=${w.limit}${w.fromEnd ? ` (asked the last ${w.fromEnd})` : ""}`);
+      return { need: { file_path: a.path, limit: w.limit, ...(w.offset !== undefined && { offset: w.offset }) } };
+    },
     answer(a, out, note) {
       const o = outcome(out);
-      const result = o.ok
-        ? { case: "success" as const, value: create(ReadSuccessSchema, {
-            path: a.path, totalLines: lineCount(o.text), output: { case: "content", value: o.text + note },
-          }) }
-        : { case: "error" as const, value: create(ReadErrorSchema, { path: a.path, error: o.why + note }) };
-      return [{ case: "readResult", value: create(ReadResultSchema, { result }) }];
+      if (!o.ok) {
+        const error = create(ReadErrorSchema, { path: a.path, error: o.why + note });
+        return [{ case: "readResult", value: create(ReadResultSchema, { result: { case: "error", value: error } }) }];
+      }
+      const w = readWindow(a);
+      const cut = boundNote(a, w, o.text);
+      const success = create(ReadSuccessSchema, {
+        path: a.path, totalLines: lineCount(o.text), truncated: cut !== "", output: { case: "content", value: o.text + cut + note },
+      });
+      // Cursor's CLI sets range_applied exactly when it cut the content to
+      // the read's range, so Cursor does not cut those lines again. A ranged
+      // Read's output is already those lines; a read with no range has none
+      // to apply, and goes out without it as the CLI's does.
+      if (w.ranged) {
+        success.$unknown = [{
+          no: READ_RANGE_APPLIED_FIELD, wireType: WireType.Varint, data: new BinaryWriter().bool(true).finish(),
+        }];
+      }
+      return [{ case: "readResult", value: create(ReadResultSchema, { result: { case: "success", value: success } }) }];
     },
   },
   shellArgs: { tool: "Bash", carriesText: true, call: inDirectory, answer: shellAnswer },
