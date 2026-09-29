@@ -35,6 +35,12 @@
 // returns to Cursor is held to that bound as well; a line that alone passes
 // the bound, and a read from the end, are each answered with a read error
 // naming the Shell route, with no client call.
+//
+// Second review: a read the bridge could not measure (a relative path, a
+// file not on its disk, a window past its scan bound) still went out for 400
+// lines, so a 100 KB line there reached the client whole. Such a read now
+// FAILS CLOSED: its error names the route (the absolute path, or sed -n
+// through the Shell tool), and the client is never called.
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { create, fromBinary, fromJson, toBinary } from "@bufbuild/protobuf";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
@@ -147,9 +153,11 @@ function handled(e: ExecServerMessage, mcp: McpToolDefinition[]) {
 
 const NO_PEEK = { buf: Buffer.alloc(0), refusal: null, closedCode: null };
 const live: Array<ReturnType<typeof fakeBridge>> = [];
+const savedLimits = { ...__test.limits };
 afterEach(() => {
   for (const fb of live.splice(0)) fb.close(0);
   __test.pausedRuns.clear();
+  Object.assign(__test.limits, savedLimits);
 });
 afterAll(() => rmSync(DIR, { recursive: true, force: true }));
 
@@ -205,6 +213,12 @@ const ONE_LINE = join(DIR, "one-line.json");
 writeFileSync(ONE_LINE, "x".repeat(100_000) + "\nshort\n");
 const SHORT = join(DIR, "short.py");
 writeFileSync(SHORT, Array.from({ length: 10 }, (_, i) => `line ${i + 1}\n`).join(""));
+const NOTES = join(DIR, "notes.txt");
+writeFileSync(NOTES, "hello\n");
+const R = join(DIR, "r.txt");
+writeFileSync(R, "r\n");
+const BIG = join(DIR, "big.py");
+writeFileSync(BIG, Array.from({ length: 2000 }, (_, i) => `line ${i + 1}\n`).join(""));
 const LONG = join(DIR, "long.py");
 writeFileSync(LONG, Array.from({ length: 1000 }, (_, i) => `line ${i + 1}\n`).join(""));
 
@@ -285,7 +299,7 @@ describe("native tool refusals", () => {
       withSchema("Read", { type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"] }),
       withSchema("Grep", { type: "object", properties: { pattern: {}, include: {} }, required: ["pattern"] }),
     ];
-    const read = reply(exec(5, "readArgs", create(ReadArgsSchema, { path: "/tmp/x" })), mcp);
+    const read = reply(exec(5, "readArgs", create(ReadArgsSchema, { path: NOTES })), mcp);
     expect(read.message.value.result.case).toBe("rejected");
     expect(read.message.value.result.value.reason).toContain('"Read"');
     const grep = reply(exec(6, "grepArgs", create(GrepArgsSchema, { pattern: "x" })), mcp);
@@ -354,40 +368,40 @@ describe("native tool refusals", () => {
 describe("native tools the caller can run are run as the caller's tool", () => {
   test("a read with Read registered reaches the client as a Read call, and Cursor is sent no refusal", async () => {
     const a = started(tools("Bash", "Read", "Grep"));
-    a.fb.feed(frame(server(exec(9, "readArgs", create(ReadArgsSchema, { path: "/tmp/notes.txt", toolCallId: "call-r1\nfc_r1" })))));
+    a.fb.feed(frame(server(exec(9, "readArgs", create(ReadArgsSchema, { path: NOTES, toolCallId: "call-r1\nfc_r1" })))));
     expect(a.fb.writes.length).toBe(0);
     const s = await readSse(a.resp);
     expect(s.finish).toBe("tool_calls");
     expect(s.toolCalls.map((c) => [c.id, c.name, JSON.parse(c.arguments)]))
-      .toEqual([["call-r1_fc_r1", "Read", { file_path: "/tmp/notes.txt", limit: BOUND }]]);
+      .toEqual([["call-r1_fc_r1", "Read", { file_path: NOTES, limit: BOUND }]]);
     expect(a.fb.writes.length).toBe(0);
     expect(__test.pausedRuns.get("call-r1_fc_r1")).toBe(a.run as never);
   });
 
   test("the client's Read output reaches Cursor as the read's own success, carrying the text", async () => {
     const { sent } = await roundTrip(tools("Read"),
-      [exec(9, "readArgs", create(ReadArgsSchema, { path: "/tmp/notes.txt", toolCallId: "call-r1" }))], ["     1\thello\n"]);
+      [exec(9, "readArgs", create(ReadArgsSchema, { path: NOTES, toolCallId: "call-r1" }))], ["     1\thello\n"]);
     const cursor = sent.find((x) => x.case === "execClientMessage")!;
     expect([cursor.value.id, cursor.value.execId]).toEqual([9, "exec-9"]);
     const read = resultOf(sent, "exec-9");
     expect(read.case).toBe("readResult");
     expect(read.value.result.case).toBe("success");
-    expect(read.value.result.value.path).toBe("/tmp/notes.txt");
+    expect(read.value.result.value.path).toBe(NOTES);
     expect(read.value.result.value.output).toEqual({ case: "content", value: "     1\thello\n" });
     expect(read.value.result.value.totalLines).toBe(1);
     expect(sent.some((x) => x.value?.message?.case === "mcpResult")).toBe(false);
   });
 
   test("a Read the client refused reaches Cursor as the read's error, carrying why", async () => {
-    const { sent } = await roundTrip(tools("Read"), [exec(9, "readArgs", create(ReadArgsSchema, { path: "/tmp/nope" }))],
-      ["<tool_use_error>File does not exist. Note: your current working directory is /tmp.</tool_use_error>"]);
+    const { sent } = await roundTrip(tools("Read"), [exec(9, "readArgs", create(ReadArgsSchema, { path: NOTES }))],
+      ["<tool_use_error>Read of this file was denied by a PreToolUse hook.</tool_use_error>"]);
     const read = resultOf(sent, "exec-9").value.result;
     expect(read.case).toBe("error");
-    expect(read.value).toMatchObject({ path: "/tmp/nope", error: "File does not exist. Note: your current working directory is /tmp." });
+    expect(read.value).toMatchObject({ path: NOTES, error: "Read of this file was denied by a PreToolUse hook." });
   });
 
   test("a read whose result never came back is answered as the read's error, not left open", async () => {
-    const { sent } = await roundTrip(tools("Read"), [exec(9, "readArgs", create(ReadArgsSchema, { path: "/tmp/x" }))], [undefined]);
+    const { sent } = await roundTrip(tools("Read"), [exec(9, "readArgs", create(ReadArgsSchema, { path: NOTES }))], [undefined]);
     const read = resultOf(sent, "exec-9").value.result;
     expect(read.case).toBe("error");
     expect(read.value.error).toBe("Tool result not provided");
@@ -568,7 +582,7 @@ describe("native tools the caller can run are run as the caller's tool", () => {
 
   test("text sent with the results rides a result that carries text, never a listing or a write", async () => {
     const { sent } = await roundTrip(tools("Read", "Write"), [
-      exec(1, "readArgs", create(ReadArgsSchema, { path: "/tmp/r.txt", toolCallId: "call-1" })),
+      exec(1, "readArgs", create(ReadArgsSchema, { path: R, toolCallId: "call-1" })),
       exec(2, "writeArgs", create(WriteArgsSchema, { path: "/tmp/w.txt", fileText: "w", toolCallId: "call-2" })),
     ], ["r", "The file /tmp/w.txt has been updated successfully."], "stop and summarize");
     expect(resultOf(sent, "exec-1").value.result.value.output.value).toBe("r\n\n<user_message>\nstop and summarize\n</user_message>");
@@ -577,7 +591,7 @@ describe("native tools the caller can run are run as the caller's tool", () => {
 
   test("a translated native and an MCP call in one chunk each get their own kind of answer", async () => {
     const { calls, sent } = await roundTrip(tools("Read", "Bash"), [
-      exec(1, "readArgs", create(ReadArgsSchema, { path: "/tmp/r.txt", toolCallId: "call-1" })),
+      exec(1, "readArgs", create(ReadArgsSchema, { path: R, toolCallId: "call-1" })),
       mcpCall(2, "call-2", "echo 2").message.value as ExecServerMessage,
     ], ["r", "2\n"]);
     expect(calls.map((c) => c.name)).toEqual(["Read", "Bash"]);
@@ -588,26 +602,26 @@ describe("native tools the caller can run are run as the caller's tool", () => {
 
 describe("a native read brings at most the bound's lines and bytes into the client's context", () => {
   test("a read with no range reaches the client as Read with the line bound as its limit", () => {
-    const { sent, calls, args } = handled(readExec(9, ABSENT), tools("Read"));
+    const { sent, calls, args } = handled(readExec(9, BIG), tools("Read"));
     expect(sent.length).toBe(0);
     expect(calls.map((c) => c.toolName)).toEqual(["Read"]);
-    expect(args).toEqual([{ file_path: ABSENT, limit: BOUND }]);
+    expect(args).toEqual([{ file_path: BIG, limit: BOUND }]);
   });
 
   test("the read's own range reaches the client as Read's offset and limit, never over the bound", () => {
-    const read = (range: { offset?: number; limit?: number }) => handled(readExec(9, ABSENT, range), tools("Read")).args;
-    expect(read({ offset: 1200, limit: 80 })).toEqual([{ file_path: ABSENT, offset: 1200, limit: 80 }]);
-    expect(read({ offset: 1200 })).toEqual([{ file_path: ABSENT, offset: 1200, limit: BOUND }]);
-    expect(read({ offset: 1200, limit: 5000 })).toEqual([{ file_path: ABSENT, offset: 1200, limit: BOUND }]);
-    expect(read({ limit: 30 })).toEqual([{ file_path: ABSENT, limit: 30 }]);
+    const read = (range: { offset?: number; limit?: number }) => handled(readExec(9, BIG, range), tools("Read")).args;
+    expect(read({ offset: 1200, limit: 80 })).toEqual([{ file_path: BIG, offset: 1200, limit: 80 }]);
+    expect(read({ offset: 1200 })).toEqual([{ file_path: BIG, offset: 1200, limit: BOUND }]);
+    expect(read({ offset: 1200, limit: 5000 })).toEqual([{ file_path: BIG, offset: 1200, limit: BOUND }]);
+    expect(read({ limit: 30 })).toEqual([{ file_path: BIG, limit: 30 }]);
     // Line 1 (or Cursor's 0, which its CLI reads as line 1) needs no offset.
-    expect(read({ offset: 1, limit: 30 })).toEqual([{ file_path: ABSENT, limit: 30 }]);
-    expect(read({ offset: 0, limit: 30 })).toEqual([{ file_path: ABSENT, limit: 30 }]);
+    expect(read({ offset: 1, limit: 30 })).toEqual([{ file_path: BIG, limit: 30 }]);
+    expect(read({ offset: 0, limit: 30 })).toEqual([{ file_path: BIG, limit: 30 }]);
   });
 
   test("a Read whose schema takes no limit is refused and named, never called unbounded", () => {
     const mcp = [withSchema("Read", { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] })];
-    const { sent, calls } = handled(readExec(9, ABSENT), mcp);
+    const { sent, calls } = handled(readExec(9, BIG), mcp);
     expect(calls).toEqual([]);
     const read = clientMessage(sent[0]!).value.message;
     expect(read.value.result.case).toBe("rejected");
@@ -684,10 +698,12 @@ describe("a native read brings at most the bound's lines and bytes into the clie
       .toEqual([{ file_path: ONE_LINE, offset: 2, limit: BOUND }]);
   });
 
-  test("text the bridge could not measure is held to the byte bound on its way to Cursor, cut at a whole line", async () => {
+  // The file grew between the bridge's measure and the client's read: the
+  // client's output is larger than the measure allowed.
+  test("text that outgrew the measure is held to the byte bound on its way to Cursor, cut at a whole line", async () => {
     const line = (n: number) => `${n}\t${"w".repeat(300)}`;
     const text = Array.from({ length: 100 }, (_, i) => line(i + 1)).join("\n");
-    const { sent } = await roundTrip(tools("Read"), [readExec(9, ABSENT)], [text]);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, SHORT)], [text]);
     const ok = resultOf(sent, "exec-9").value.result.value;
     const content: string = ok.output.value;
     const at = content.indexOf("\n\n[");
@@ -697,13 +713,13 @@ describe("a native read brings at most the bound's lines and bytes into the clie
     expect(kept).toBe(Array.from({ length: last }, (_, i) => line(i + 1)).join("\n"));
     expect(utf8(kept + "\n" + line(last + 1))).toBeGreaterThan(BYTES);
     expect(content.slice(at)).toContain(`stops at line ${last}: the text was cut to the ${BYTES} bytes the bridge brings per read`);
-    expect(content.slice(at)).toContain(`sed -n '${last + 1},${last + BOUND}p' '${ABSENT}'`);
+    expect(content.slice(at)).toContain(`sed -n '${last + 1},${last + BOUND}p' '${SHORT}'`);
     expect(ok.truncated).toBe(true);
   });
 
-  test("one unmeasured line past the byte bound reaches Cursor cut at a character, with the bytes it holds named", async () => {
+  test("one line that outgrew the measure reaches Cursor cut at a character, with the bytes it holds named", async () => {
     const text = `1\t${"é".repeat(30_000)}`;   // 60,000 bytes of text
-    const { sent } = await roundTrip(tools("Read"), [readExec(9, ABSENT)], [text]);
+    const { sent } = await roundTrip(tools("Read"), [readExec(9, SHORT)], [text]);
     const content: string = resultOf(sent, "exec-9").value.result.value.output.value;
     const at = content.indexOf("\n\n[");
     const kept = content.slice(0, at);
@@ -712,7 +728,7 @@ describe("a native read brings at most the bound's lines and bytes into the clie
     const held = utf8(kept) - utf8("1\t");
     expect(held).toBe(BYTES - 2);   // "1<tab>" plus 11,999 two-byte characters
     expect(content.slice(at)).toContain(`stops partway through line 1: it holds the first ${held} bytes of that line`);
-    expect(content.slice(at)).toContain(`sed -n '1p' '${ABSENT}' | cut -b ${held + 1}-${held + BYTES}`);
+    expect(content.slice(at)).toContain(`sed -n '1p' '${SHORT}' | cut -b ${held + 1}-${held + BYTES}`);
   });
 
   test("a read of its own range gets exactly those lines, marked applied so Cursor does not cut them again", async () => {
@@ -741,6 +757,46 @@ describe("a native read brings at most the bound's lines and bytes into the clie
     const ok = resultOf(sent, "exec-9").value.result.value;
     expect(ok.output.value).toBe(text);
     expect(ok.truncated).toBe(false);
+  });
+
+  // A read the bridge cannot measure fails closed: the fit to the byte bound
+  // is not proven, so the client is never called.
+  test("a relative path is answered with a read error naming the absolute path and the Shell route, with no client call", () => {
+    const { sent, calls } = handled(readExec(9, "notes.txt"), tools("Read"));
+    expect(calls).toEqual([]);
+    expect(sent.length).toBe(1);
+    const result = clientMessage(sent[0]!).value.message.value.result;
+    expect(result.case).toBe("error");
+    expect(result.value.path).toBe("notes.txt");
+    expect(result.value.error).toContain("not an absolute path on this machine");
+    expect(result.value.error).toContain("by its absolute path");
+    expect(result.value.error).toContain(`sed -n '1,${BOUND}p' 'notes.txt' | cut -b 1-${BYTES}`);
+  });
+
+  test("a file not on the bridge's disk is answered with a read error naming the Shell route, with no client call", () => {
+    for (const [range, lines] of [[{}, `1,${BOUND}`], [{ offset: 50, limit: 20 }, "50,69"]] as const) {
+      const { sent, calls } = handled(readExec(9, ABSENT, range), tools("Read"));
+      expect(calls).toEqual([]);
+      expect(sent.length).toBe(1);
+      const result = clientMessage(sent[0]!).value.message.value.result;
+      expect(result.case).toBe("error");
+      expect(result.value.error).toContain("no file is at that path on this machine");
+      expect(result.value.error).toContain(`sed -n '${lines}p' '${ABSENT}' | cut -b 1-${BYTES}`);
+      expect(result.value.error).toContain("Shell");
+    }
+  });
+
+  test("a window past the scan bound is answered with a read error naming the Shell route, with no client call", () => {
+    __test.limits.readScanBytes = 4096;   // the page's line 300 starts near byte 87,000
+    const { sent, calls } = handled(readExec(9, PAGE, { offset: 300 }), tools("Read"));
+    expect(calls).toEqual([]);
+    expect(sent.length).toBe(1);
+    const result = clientMessage(sent[0]!).value.message.value.result;
+    expect(result.case).toBe("error");
+    expect(result.value.error).toContain("past the first 4096 bytes the bridge measures");
+    expect(result.value.error).toContain(`sed -n '300,${300 + BOUND - 1}p' '${PAGE}' | cut -b 1-${BYTES}`);
+    // A window inside the scan bound still reads.
+    expect(handled(readExec(10, SHORT), tools("Read")).args).toEqual([{ file_path: SHORT, limit: BOUND }]);
   });
 
   // F2: Read counts lines from the start only, so a negative offset is never
