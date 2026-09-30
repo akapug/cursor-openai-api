@@ -202,6 +202,24 @@ describe("a kept Cursor conversation", () => {
     expect(req.conversationState!.turns.map((t) => Buffer.from(t).toString())).toEqual([Buffer.from(blobId("t3")).toString()]);
   });
 
+  test("a continued run that sends no checkpoint of its own is not kept, and the next turn replays", async () => {
+    // Kept under the new history with the previous turn's checkpoint, the
+    // conversation would lose this turn's user text and reply on Cursor's
+    // side while the client's history carries them.
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta("noted")));
+    const second: Msg[] = [...FIRST, { role: "assistant", content: "noted" }, { role: "user", content: "next" }];
+    const two = await turn(second, frame(textDelta("ok")));
+    const id = runRequest(two.fb).req.conversationId;
+    expect(text(runRequest(two.fb).req)).toBe("next");
+    expect(__test.keptConversations.size).toBe(0);
+    expect(logged.some((l) => l.includes(`Cursor conversation ${id.slice(0, 8)} is not kept, since Cursor sent no checkpoint`))).toBe(true);
+    const three = await turn([...second, { role: "assistant", content: "ok" }, { role: "user", content: "and then" }], frame(textDelta("done")));
+    const { req } = runRequest(three.fb);
+    expect(req.conversationId).not.toBe(id);
+    expect(req.conversationState!.turns.length).toBe(0);
+    expect(req.conversationState!.rootPromptMessagesJson.length).toBe(5);
+  });
+
   test("the reminders Claude Code sends with a new prompt ride the new turn's text", async () => {
     await turn(FIRST, checkpointFrame("t1"), frame(textDelta("noted")));
     const second: Msg[] = [...FIRST, { role: "assistant", content: "noted" },
