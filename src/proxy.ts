@@ -57,6 +57,7 @@ import {
   LsResultSchema,
   LsSuccessSchema,
   McpErrorSchema,
+  McpInstructionsSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
@@ -90,6 +91,7 @@ import {
   WriteShellStdinResultSchema,
   WriteSuccessSchema,
   type AgentServerMessage,
+  type ConversationStateStructure,
   type ExecServerMessage,
   type FetchArgs,
   type GrepArgs,
@@ -220,6 +222,47 @@ interface CursorRequestPayload {
   mcpTools: McpToolDefinition[];
   /** The client conversation this request carries (`conversationStamp`). */
   conversation?: ConversationStamp;
+  /** Cursor's conversation id on the request (a new one for a replay). */
+  conversationId: string;
+  /** The request's messageChain, for keeping the conversation when its run closes. */
+  chain?: string[];
+  /**
+   * Set when the request continues a kept Cursor conversation: the entry it
+   * was taken from, and the replay of the whole history to run instead when
+   * Cursor will not continue it (startRun).
+   */
+  continued?: { kept: KeptConversation; replay: () => CursorRequestPayload };
+}
+
+/**
+ * helm patch (2026-09-30, task/3817): A CURSOR CONVERSATION KEPT BETWEEN THE
+ * CLIENT'S TURNS. Cursor's own CLI keeps one conversation per chat: after
+ * each step Cursor sends a checkpoint (conversationCheckpointUpdate), the CLI
+ * stores it with the blobs Cursor wrote (KV setBlobArgs), and the next turn
+ * sends that checkpoint back under the same conversation id with only the new
+ * user message. This bridge used to throw the checkpoint away and replay the
+ * whole client history into a new conversation (random id, every message a
+ * root-prompt blob) at the start of every run. MEASURED on the cursor seat's
+ * bridge.log: on that cold replay Cursor's count for the same ~140k history
+ * swung 107k/214k/426k/905k, over its 256k window in 16 of 24 run starts,
+ * and 13 of 15 turns over 256k made no tool call; mid-run it counted ~0.77x
+ * of the estimate. A run that closes cleanly now leaves its conversation
+ * here, and a request whose history extends it by the reply and new user
+ * text continues it (continuation).
+ */
+interface KeptConversation {
+  /** Cursor's conversation id, the same on every run that continues it. */
+  id: string;
+  /** Cursor's latest checkpoint: the state the next run sends back. */
+  state: ConversationStateStructure;
+  /** Every blob Cursor may ask back for: the replayed root prompt and what Cursor stored. */
+  blobs: Map<string, Uint8Array>;
+  /** messageChain of the request the last run answered. */
+  chain: string[];
+  /** Runs this conversation has carried; 1 is the replay that opened it. */
+  runs: number;
+  /** When it was kept (Date.now), for eviction. */
+  at: number;
 }
 
 /**
@@ -335,11 +378,29 @@ interface Run {
   failure: Error | null;
   /** Set while a resumed run waits for its first frame; called once it comes. */
   opening: (() => void) | null;
+  /** Cursor's conversation id for this run (see KeptConversation). */
+  conversationId?: string;
+  /** Runs that conversation has carried, this one included. */
+  conversationRuns?: number;
+  /** The latest checkpoint Cursor sent on this run. */
+  checkpoint?: ConversationStateStructure | null;
+  /** messageChain of the request now attached (or last attached). */
+  chain?: string[];
+  /** Why the bridge ended this run itself (endRun); a run so ended is never kept. */
+  ended?: string | null;
+  /** Bytes this run sent Cursor: the run request, then every answer (blobs, exec results). */
+  sent?: { request: number; answers: number; blobs: number; blobBytes: number };
 }
 
 /** Paused runs by the client-facing id of every tool call they await. */
 const pausedRuns = new Map<string, Run>();
 let runSerial = 0;
+
+/** Kept Cursor conversations, by the last digest of the chain they answered. */
+const keptConversations = new Map<string, KeptConversation>();
+
+/** The seam tests replace to run a scripted Cursor stream (startRun). */
+const seams = { spawn: (accessToken: string): Bridge => spawnBridge(accessToken) };
 
 /**
  * helm patch (2026-09-27): THE CLIENT'S IDLE TIMEOUT. Bun.serve closes a
@@ -424,6 +485,16 @@ const limits = {
    * proven to fit, so that read fails closed.
    */
   readScanBytes: 64 * 1024 * 1024,
+  /**
+   * helm patch (2026-09-30, task/3817): kept Cursor conversations. A seat and
+   * the subagents it spawns are one conversation each; a subagent's is never
+   * continued once it returns, so the oldest go past this many.
+   */
+  keptMax: 16,
+  /** A kept conversation nobody continued for this long is dropped. */
+  keptTtlMs: 12 * 60 * 60_000,
+  /** A conversation whose blobs pass this many bytes is not kept (its next turn replays). */
+  keptBlobBytes: 64 * 1024 * 1024,
 };
 
 // --- H2 Bridge IPC ---
@@ -628,11 +699,14 @@ async function handleChatCompletion(
     );
   }
 
+  const chain = messageChain(body.messages);
+
   // A request whose trailing tool results answer a paused run resumes it,
   // unless the conversation was rewritten under it (takePausedRun). That path
   // sends results directly and synthesizes neither stateless prompt.
   const paused = takePausedRun(body.messages);
   if (paused) {
+    paused.chain = chain;
     const promptTokens = requestTokens(body.messages, tools, false);
     const resumed = resumeRun(paused, toolResults, tailText, body.stream !== false, promptTokens);
     if (resumed) return resumed;
@@ -640,18 +714,169 @@ async function handleChatCompletion(
   }
 
   const promptTokens = requestTokens(body.messages, tools, true);
+  const mcpTools = buildMcpToolDefinitions(tools);
 
   // helm patch (2026-09-16): TOOL RESULTS WERE SILENTLY DROPPED ON THE
   // STATELESS PATH, so the model saw its own tool call with no output and
   // concluded the tool was broken. Every request that reaches here carries
   // its whole conversation — tool calls and results included — as structured
   // history (toHistory), so nothing the client sent is dropped.
-  const { history, userText } = toHistory(body.messages);
-  const payload = buildCursorRequest(modelId, systemPrompt, history, userText);
-  payload.mcpTools = buildMcpToolDefinitions(tools);
-  payload.conversation = conversationStamp(body.messages);
+  const replay = (): CursorRequestPayload => {
+    const { history, userText } = toHistory(body.messages);
+    const payload = buildCursorRequest(modelId, systemPrompt, history, userText);
+    payload.mcpTools = mcpTools;
+    payload.conversation = conversationStamp(body.messages);
+    payload.chain = chain;
+    return payload;
+  };
 
+  // helm patch (2026-09-30, task/3817): a request that extends a kept Cursor
+  // conversation by its reply and new user text sends Cursor only that text,
+  // with the conversation's checkpoint; any other request replays its
+  // history, and the log says why.
+  const found = continuation(body.messages, chain);
+  if ("why" in found) {
+    const payload = replay();
+    console.error(`[bridge] new Cursor conversation ${short(payload.conversationId)}: replaying ${body.messages.length} messages (${kb(payload.blobStore)}); ${found.why}`);
+    return startRun(payload, accessToken, modelId, body.stream !== false, promptTokens);
+  }
+  const payload = buildContinuation(modelId, found.kept, found.text);
+  payload.mcpTools = mcpTools;
+  payload.conversation = conversationStamp(body.messages);
+  payload.chain = chain;
+  payload.continued = { kept: found.kept, replay };
   return startRun(payload, accessToken, modelId, body.stream !== false, promptTokens);
+}
+
+// --- Kept Cursor conversations (helm patch 2026-09-30, task/3817) ---
+
+/**
+ * One digest per prefix of the client's messages: chain[i] covers messages
+ * 0..i-1, so chain[0] is the empty conversation. Each message is read the way
+ * the bridge reads it (role, text, tool-call id, tool calls), so the fields
+ * Cursor never sees (cache markers, thinking signatures) do not break a match.
+ */
+function messageChain(messages: OpenAIMessage[]): string[] {
+  const chain = [createHash("sha256").update("cursor-openai-api conversation").digest("hex")];
+  for (const m of messages) {
+    const face = JSON.stringify([
+      m.role,
+      contentToText(m.content),
+      m.tool_call_id ?? "",
+      (m.tool_calls ?? []).map((c) => [c.id, c.function.name, c.function.arguments ?? ""]),
+    ]);
+    chain.push(createHash("sha256").update(chain.at(-1)!).update(face).digest("hex"));
+  }
+  return chain;
+}
+
+/** The first eight characters of a conversation id, for log lines. */
+const short = (id: string): string => id.slice(0, 8);
+
+/** The bytes a blob store holds, for log lines. */
+function blobBytes(blobs: Map<string, Uint8Array>): number {
+  let n = 0;
+  for (const b of blobs.values()) n += b.length;
+  return n;
+}
+
+const kb = (blobs: Map<string, Uint8Array>): string => `${(blobBytes(blobs) / 1024).toFixed(1)} KB`;
+
+/** Drop kept conversations past their idle limit, then the oldest past the count limit. */
+function pruneKept(now = Date.now()): void {
+  for (const [key, kept] of keptConversations) {
+    if (now - kept.at > limits.keptTtlMs) keptConversations.delete(key);
+  }
+  const byAge = [...keptConversations.entries()].sort((a, b) => a[1].at - b[1].at);
+  while (byAge.length > limits.keptMax) keptConversations.delete(byAge.shift()![0]);
+}
+
+/**
+ * The kept conversation this request continues and the new text it adds, or
+ * why it continues none. It continues one when its first n messages are
+ * exactly the request that conversation's last run answered, message n is
+ * the reply that run gave (an assistant message with no tool call), and every
+ * message after it is user text. Anything else replays: a compaction, a
+ * /clear or an edited history no longer extends the conversation, and a
+ * tool result or an assistant turn after the reply is a turn Cursor's
+ * conversation never saw.
+ */
+function continuation(
+  messages: OpenAIMessage[],
+  chain: string[],
+): { kept: KeptConversation; text: string } | { why: string } {
+  pruneKept();
+  for (let n = messages.length - 2; n >= 1; n--) {
+    const kept = keptConversations.get(chain[n]!);
+    if (!kept) continue;
+    const reply = messages[n]!;
+    const added = messages.slice(n + 1);
+    const at = `Cursor conversation ${short(kept.id)} covers this history's first ${n} messages`;
+    if (reply.role !== "assistant" || reply.tool_calls?.length) {
+      return { why: `${at}, but message ${n + 1} is not its reply (${reply.role}${reply.tool_calls?.length ? " with tool calls" : ""})` };
+    }
+    const other = added.find((m) => m.role !== "user");
+    if (other) {
+      return { why: `${at}, but a ${other.role} message follows its reply, a turn that conversation never saw` };
+    }
+    const text = added.map((m) => contentToText(m.content)).filter((t) => t.trim()).join("\n\n");
+    if (!text) return { why: `${at}, but the ${added.length} message(s) after its reply carry no text` };
+    keptConversations.delete(chain[n]!);
+    return { kept, text };
+  }
+  return { why: divergence(chain) };
+}
+
+/** Why no kept conversation is continued: the closest one, and where this history leaves it. */
+function divergence(chain: string[]): string {
+  if (!keptConversations.size) {
+    return "no Cursor conversation is kept (the first request since the bridge started, or the last run did not close cleanly)";
+  }
+  let best: { kept: KeptConversation; shared: number } | null = null;
+  for (const kept of keptConversations.values()) {
+    let shared = 0;
+    while (shared + 1 < Math.min(kept.chain.length, chain.length) && kept.chain[shared + 1] === chain[shared + 1]) shared++;
+    if (!best || shared > best.shared) best = { kept, shared };
+  }
+  if (!best!.shared) {
+    return `no kept Cursor conversation opens the way this history does (a new session or subagent, or a /clear); ${keptConversations.size} kept`;
+  }
+  const had = best!.kept.chain.length - 1;
+  return `the history no longer extends Cursor conversation ${short(best!.kept.id)}: it keeps ${best!.shared} of that conversation's ${had} messages and then differs (a compaction, a rewind or an edited history)`;
+}
+
+/**
+ * Keep a run's Cursor conversation for the client's next turn: only a run
+ * that closed on its own, with no error, no tool call waiting, and a
+ * checkpoint to send back. The reply it closed on is the message the next
+ * request must carry at chain.length - 1 (continuation).
+ */
+function keepConversation(run: Run): void {
+  const why = run.ended ? `the bridge ended it (${run.ended})`
+    : run.failure ? `Cursor ended it with ${run.failure.message}`
+    : run.pauseAfterChunk || run.awaiting.length || run.queued.length ? "a tool call is still waiting"
+    : !run.checkpoint ? "Cursor sent no checkpoint"
+    : !run.chain || !run.conversationId ? "it has no client conversation"
+    : "";
+  if (why) {
+    if (run.conversationId) console.error(`[bridge] run ${run.id}: Cursor conversation ${short(run.conversationId)} is not kept, since ${why}; the next request replays its history`);
+    return;
+  }
+  const bytes = blobBytes(run.blobStore);
+  if (bytes > limits.keptBlobBytes) {
+    console.error(`[bridge] run ${run.id}: Cursor conversation ${short(run.conversationId!)} is not kept: its blobs hold ${bytes} bytes, over ${limits.keptBlobBytes}; the next request replays its history`);
+    return;
+  }
+  keptConversations.set(run.chain!.at(-1)!, {
+    id: run.conversationId!,
+    state: run.checkpoint!,
+    blobs: run.blobStore,
+    chain: run.chain!,
+    runs: run.conversationRuns ?? 1,
+    at: Date.now(),
+  });
+  pruneKept();
+  trace(`run ${run.id} kept Cursor conversation ${short(run.conversationId!)} (${run.chain!.length - 1} messages, ${bytes} blob bytes)`);
 }
 
 // --- Message Parsing ---
@@ -895,6 +1120,31 @@ function buildCursorRequest(
     readPaths: [],
   });
 
+  return runRequestPayload(modelId, conversationState, userText, crypto.randomUUID(), blobStore);
+}
+
+/**
+ * helm patch (2026-09-30, task/3817): continue a kept Cursor conversation.
+ * The run request carries Cursor's own last checkpoint (fields this proto
+ * cannot read ride along as they came) under the conversation's id, and only
+ * the new user text as its action; Cursor asks for any blob it needs back
+ * from the kept store, as Cursor's own CLI serves them from its local one.
+ */
+function buildContinuation(
+  modelId: string,
+  kept: KeptConversation,
+  userText: string,
+): CursorRequestPayload {
+  return runRequestPayload(modelId, kept.state, userText, kept.id, kept.blobs);
+}
+
+function runRequestPayload(
+  modelId: string,
+  conversationState: ConversationStateStructure,
+  userText: string,
+  conversationId: string,
+  blobStore: Map<string, Uint8Array>,
+): CursorRequestPayload {
   const userMessage = create(UserMessageSchema, {
     text: userText,
     messageId: crypto.randomUUID(),
@@ -916,7 +1166,7 @@ function buildCursorRequest(
     conversationState,
     action,
     modelDetails,
-    conversationId: crypto.randomUUID(),
+    conversationId,
   });
 
   const clientMessage = create(AgentClientMessageSchema, {
@@ -927,6 +1177,7 @@ function buildCursorRequest(
     requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
     blobStore,
     mcpTools: [],
+    conversationId,
   };
 }
 
@@ -1024,6 +1275,8 @@ type FirstFramePeek = {
   buf: Buffer;
   refusal: { code: string; message: string } | null;
   closedCode: number | null;
+  /** Any Connect error the first frame ended the stream with, a refusal or not. */
+  error?: Error | null;
 };
 
 // Accumulates bridge output until ONE complete Connect frame is present (or
@@ -1053,6 +1306,7 @@ function peekFirstFrame(
       if (flags & CONNECT_END_STREAM_FLAG) {
         const err = parseConnectEndStream(peek.buf.subarray(5, 5 + msgLen));
         peek.refusal = err ? connectRefusal(err) : null;
+        peek.error = err;
       }
       finish();
     });
@@ -1094,6 +1348,8 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onTokens: (counts: TokenCounts) => void = () => {},
+  onCheckpoint: (state: ConversationStateStructure) => void = () => {},
+  onBlobServed: (bytes: number) => void = () => {},
 ): void {
   const msgCase = msg.message.case;
   if (TRACE) {
@@ -1115,8 +1371,9 @@ function processServerMessage(
     trace("checkpoint tokenDetails", msg.message.value.tokenDetails
       ? `used=${used} max=${msg.message.value.tokenDetails.maxTokens}` : "absent");
     if (used) onTokens({ context: used });
+    onCheckpoint(msg.message.value);
   } else if (msgCase === "kvServerMessage") {
-    handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
+    handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame, onBlobServed);
   } else if (msgCase === "execServerMessage") {
     handleExecMessage(
       msg.message.value as ExecServerMessage,
@@ -1154,6 +1411,7 @@ function handleKvMessage(
   kvMsg: KvServerMessage,
   blobStore: Map<string, Uint8Array>,
   sendFrame: (data: Uint8Array) => void,
+  onBlobServed: (bytes: number) => void = () => {},
 ): void {
   const kvCase = kvMsg.message.case;
 
@@ -1161,6 +1419,8 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
+    if (!blobData) console.error(`[bridge] Cursor asked for blob ${blobIdKey.slice(0, 16)} and the store does not hold it`);
+    onBlobServed(blobData?.length ?? 0);
 
     const response = create(KvClientMessageSchema, {
       id: kvMsg.id,
@@ -1215,7 +1475,7 @@ function handleExecMessage(
       tools: mcpTools,
       gitRepos: [],
       projectLayouts: [],
-      mcpInstructions: [],
+      mcpInstructions: mcpInstructionsFor(mcpTools),
       fileContents: {},
       customSubagents: [],
     });
@@ -1454,6 +1714,39 @@ const NATIVE_TOOL_EQUIVALENT: Record<string, string[]> = {
   deleteArgs: ["Bash"],
   fetchArgs: ["WebFetch", "Bash"],
 };
+
+/**
+ * helm patch (2026-09-30, task/3817): THE CALLER'S TOOLS ARE NAMED IN CURSOR'S
+ * OWN MCP INSTRUCTIONS, SO THE MODEL KNOWS THEM WITHOUT GetDynamicTools.
+ * MEASURED on the cursor seat (transcript 46c53e63, 16:34-16:35Z): after a
+ * compaction the model listed Cursor's own tools (Shell, Grep, StrReplace,
+ * Write, Read, Glob, AskQuestion, GetDynamicTools, CallDynamicTool), decided
+ * "the Monitor tool is unavailable in this Cursor session" and left its
+ * beacon dead, although it had armed Monitor through CallDynamicTool five
+ * times that session and never called GetDynamicTools to look. The only other
+ * place the route was written was the client's system prompt, which reaches
+ * Cursor as one more root-prompt message. RequestContext.mcp_instructions is
+ * where Cursor's own CLI puts an MCP server's instructions, and Cursor asks
+ * for the request context on every run, so every run, a replayed or a
+ * continued one, names each registered tool and the exact call. The list is
+ * built from the tools the request registered, so it cannot drift from them.
+ */
+function mcpInstructionsFor(mcpTools: McpToolDefinition[]) {
+  if (!mcpTools.length) return [];
+  const lines = mcpTools.map((t) => {
+    const name = t.toolName || t.name;
+    const first = (t.description || "").replace(/\s+/g, " ").trim().split(/(?<=[.!?])\s/)[0] ?? "";
+    return `- ${name}${first ? `: ${first.length > 160 ? `${first.slice(0, 157)}...` : first}` : ""}`;
+  });
+  const example = mcpTools.find((t) => (t.toolName || t.name) === "Monitor") ?? mcpTools[0]!;
+  const instructions = [
+    `Every tool of this session is a tool on this MCP server, "${MCP_PROVIDER}". Call one with CallDynamicTool: namespace "${MCP_PROVIDER}", toolName the tool's name below, and the tool's own arguments. For example ${example.toolName || example.name} is CallDynamicTool with namespace "${MCP_PROVIDER}" and toolName "${example.toolName || example.name}".`,
+    `These tools exist whether or not you have called GetDynamicTools; call GetDynamicTools only to read a tool's full argument schema. Never conclude that one of them is unavailable without calling it.`,
+    `The tools on "${MCP_PROVIDER}":`,
+    ...lines,
+  ].join("\n");
+  return [create(McpInstructionsSchema, { serverName: MCP_PROVIDER, instructions })];
+}
 
 function rejectReason(execCase: string | undefined, mcpTools: McpToolDefinition[]): string {
   const registered = new Set(mcpTools.map((t) => t.toolName || t.name));
@@ -2154,17 +2447,29 @@ async function startRun(
   stream: boolean,
   promptTokens: number,
 ): Promise<Response> {
-  const bridge = spawnBridge(accessToken);
+  const bridge = seams.spawn(accessToken);
   bridge.write(frameConnectMessage(payload.requestBytes));
   const heartbeatTimer = setInterval(() => {
     bridge.write(makeHeartbeatBytes());
   }, 5_000);
   const peeked = await peekFirstFrame(bridge, limits.firstFrameMs);
+  const continued = payload.continued;
   if (peeked.refusal) {
     clearInterval(heartbeatTimer);
     bridge.end();
     console.error(`[bridge] upstream refusal on first frame: ${peeked.refusal.code} -> 429`);
+    // The client retries a 429; the conversation it would have continued waits for it.
+    if (continued) keptConversations.set(continued.kept.chain.at(-1)!, continued.kept);
     return refusalResponse(peeked.refusal);
+  }
+  if (continued && peeked.error) {
+    // Cursor would not continue the kept conversation: answer this request
+    // from a replay of the whole history instead, and say so.
+    clearInterval(heartbeatTimer);
+    bridge.end();
+    const payload = continued.replay();
+    console.error(`[bridge] Cursor would not continue conversation ${short(continued.kept.id)} (${peeked.error.message}); new Cursor conversation ${short(payload.conversationId)}: replaying the history (${kb(payload.blobStore)})`);
+    return startRun(payload, accessToken, modelId, stream, promptTokens);
   }
   const run: Run = {
     id: ++runSerial,
@@ -2192,9 +2497,24 @@ async function startRun(
     conversation: payload.conversation,
     failure: null,
     opening: null,
+    conversationId: payload.conversationId,
+    conversationRuns: continued ? continued.kept.runs + 1 : 1,
+    checkpoint: continued?.kept.state ?? null,
+    chain: payload.chain,
+    ended: null,
+    sent: { request: payload.requestBytes.length, answers: 0, blobs: 0, blobBytes: 0 },
   };
   trace(`run ${run.id} started (${modelId})`);
+  if (continued) {
+    console.error(`[bridge] run ${run.id} continues Cursor conversation ${short(payload.conversationId)} (run ${run.conversationRuns} of it): sent ${payload.requestBytes.length} bytes, its checkpoint and the new turn; no history replayed`);
+  }
   return respond(run, stream, () => listen(run, peeked));
+}
+
+/** Write a frame to Cursor on this run, counting it as an answer (Run.sent). */
+function sendOnRun(run: Run, data: Uint8Array): void {
+  if (run.sent) run.sent.answers += data.length;
+  run.bridge.write(data);
 }
 
 /** Take over the bridge from the first-frame peek: every byte it held, then the rest. */
@@ -2235,10 +2555,16 @@ function feed(run: Run, chunk: Buffer): void {
         msg,
         run.blobStore,
         run.mcpTools,
-        (data) => run.bridge.write(data),
+        (data) => sendOnRun(run, data),
         (text, isThinking) => emitText(run, text, Boolean(isThinking)),
         (exec) => onExec(run, exec),
         (counts) => countTokens(run, counts),
+        (state) => { run.checkpoint = state; },
+        (bytes) => {
+          if (!run.sent) return;
+          run.sent.blobs++;
+          run.sent.blobBytes += bytes;
+        },
       );
     } catch (err) {
       // One bad frame must not end the read loop — that loop is the only
@@ -2379,6 +2705,11 @@ function onRunClosed(run: Run, code: number): void {
   forget(run);
   armStall(run);
   trace(`run ${run.id} closed (code ${code})`);
+  if (run.sent) {
+    const { request, answers, blobs, blobBytes } = run.sent;
+    console.error(`[bridge] run ${run.id} closed: sent Cursor ${request + answers} bytes (the run request ${request}, then ${answers} in answers, ${blobs} blob fetches of ${blobBytes})`);
+  }
+  keepConversation(run);
   if (run.opening) {
     run.opening();
     return;
@@ -2405,6 +2736,7 @@ function forget(run: Run): void {
 function endRun(run: Run, why: string): void {
   forget(run);
   if (run.closed) return;
+  run.ended ??= why;
   console.error(`[bridge] run ${run.id} ended: ${why}`);
   clearInterval(run.heartbeatTimer);
   run.bridge.end();
@@ -2497,7 +2829,7 @@ function resumeRun(
     const ride = i === last ? note : "";
     if (!result) console.error(`[bridge] run ${run.id}: no result for tool call ${exec.toolCallId}`);
     if (exec.native) {
-      for (const frame of nativeFrames(exec, result?.content, ride)) run.bridge.write(frame);
+      for (const frame of nativeFrames(exec, result?.content, ride)) sendOnRun(run, frame);
       continue;
     }
     const mcpResult = result
@@ -2531,7 +2863,7 @@ function resumeRun(
     const clientMessage = create(AgentClientMessageSchema, {
       message: { case: "execClientMessage", value: execClientMessage },
     });
-    run.bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+    sendOnRun(run, frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
   }
   run.awaiting = [];
   trace(`run ${run.id} resumed`);
@@ -2867,4 +3199,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { IDLE_TIMEOUT_S, IDLE_MARGIN_MS, stallWindow, requestTokens, handleChatCompletion, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages };
+export const __test = { IDLE_TIMEOUT_S, IDLE_MARGIN_MS, stallWindow, requestTokens, handleChatCompletion, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages, seams, keptConversations, messageChain, continuation, buildContinuation, mcpInstructionsFor };
