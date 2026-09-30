@@ -382,7 +382,7 @@ interface Run {
   conversationId?: string;
   /** Runs that conversation has carried, this one included. */
   conversationRuns?: number;
-  /** The latest checkpoint Cursor sent on this run. */
+  /** The latest checkpoint Cursor sent on this run (never one it was started from). */
   checkpoint?: ConversationStateStructure | null;
   /** messageChain of the request now attached (or last attached). */
   chain?: string[];
@@ -2502,7 +2502,11 @@ async function startRun(
     opening: null,
     conversationId: payload.conversationId,
     conversationRuns: continued ? continued.kept.runs + 1 : 1,
-    checkpoint: continued?.kept.state ?? null,
+    // Only a checkpoint Cursor sends on THIS run may be kept: seeded with
+    // the kept one, a continued run that closed without its own would be kept
+    // under the new history holding the previous turn's state, and the next
+    // continuation would lose this turn on Cursor's side.
+    checkpoint: null,
     chain: payload.chain,
     ended: null,
     sent: { request: payload.requestBytes.length, answers: 0, blobs: 0, blobBytes: 0 },
