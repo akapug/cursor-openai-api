@@ -245,6 +245,14 @@ describe("a replay, and the log says why", () => {
     expect(logged.some((l) => l.includes("keeps 3 of that conversation's 4 messages"))).toBe(true);
   });
 
+  test("a retry of an earlier point replays and says it is a rewind", async () => {
+    const second: Msg[] = [...FIRST, { role: "assistant", content: "noted" }, { role: "user", content: "next" }];
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta("noted")));
+    await turn(second, checkpointFrame("t2"), frame(textDelta("ok")));
+    await turn(FIRST, frame(textDelta("noted again")));
+    expect(logged.some((l) => l.includes("all 2 of its messages are that conversation's first (a rewind or a retry)"))).toBe(true);
+  });
+
   test("a run the client hung up on is not kept, and the next turn replays", async () => {
     const pending = ask(FIRST);
     const fb = bridges.at(-1)!;

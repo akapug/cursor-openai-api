@@ -842,6 +842,9 @@ function divergence(chain: string[]): string {
     return `no kept Cursor conversation opens the way this history does (a new session or subagent, or a /clear); ${keptConversations.size} kept`;
   }
   const had = best!.kept.chain.length - 1;
+  if (best!.shared === chain.length - 1) {
+    return `this history is an earlier point of Cursor conversation ${short(best!.kept.id)}: all ${best!.shared} of its messages are that conversation's first (a rewind or a retry)`;
+  }
   return `the history no longer extends Cursor conversation ${short(best!.kept.id)}: it keeps ${best!.shared} of that conversation's ${had} messages and then differs (a compaction, a rewind or an edited history)`;
 }
 
