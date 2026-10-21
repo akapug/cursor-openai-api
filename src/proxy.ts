@@ -2741,9 +2741,12 @@ function trackToolCalls(run: Run, msg: AgentServerMessage): void {
  * had no trace) and the failed result of a tool call Cursor completed on its
  * own (toolCallCompleted). A run marked so that sent the bridge no tool exec
  * at all is not kept (keepConversation), and the next request replays. The
- * run itself is not retried: its reply already went to the client.
+ * run itself is not retried: its reply already went to the client. A reply
+ * that only quotes the phrase (a seat discussing this) also drops the keep;
+ * that costs one replay, accepted. CURSOR_BRIDGE_TOOL_UNAVAILABLE moves the
+ * phrase if Cursor rewords it.
  */
-const TOOL_UNAVAILABLE = "tool not available";
+const TOOL_UNAVAILABLE = (process.env.CURSOR_BRIDGE_TOOL_UNAVAILABLE || "tool not available").toLowerCase();
 
 const jsonSafe = (_: string, v: unknown): unknown =>
   typeof v === "bigint" ? String(v) : v instanceof Uint8Array ? undefined : v;
