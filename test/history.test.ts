@@ -1,4 +1,4 @@
-// helm arm (2026-09-25): prior turns reach Cursor as structured root-prompt
+// Regression test (2026-09-25): prior turns reach Cursor as structured root-prompt
 // messages — tool calls and tool results as typed parts, in order — instead
 // of a text transcript that dropped every tool call and pasted every tool
 // result at the top of the latest message.

@@ -88,7 +88,7 @@ if (!clientVersion) {
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
-// helm patch (2026-09-25): NO WALL-CLOCK DEADLINE ON THE STREAM. This child
+// Patch (2026-09-25): NO WALL-CLOCK DEADLINE ON THE STREAM. This child
 // used to kill itself 120 s after spawn whatever was happening, so any Cursor
 // run longer than two minutes — a long think, or a run paused while the
 // client executes a tool — was cut off and ended as a clean "stop" with no

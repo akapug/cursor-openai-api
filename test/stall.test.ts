@@ -1,4 +1,4 @@
-// helm arm (2026-09-25, 2026-09-27): a client attached to a run Cursor has
+// Regression test (2026-09-25, 2026-09-27): a client attached to a run Cursor has
 // gone silent on, or that waits on a tool call Cursor never completes, is
 // told so in words and the run is ended, instead of hanging until the
 // client's idle timeout turns the turn into "unexpected EOF". A model that
@@ -46,7 +46,7 @@ describe("stall watchdog", () => {
   });
 
   test("a model thinking with heartbeats only and no tool call open is not a stall", async () => {
-    // MEASURED 2026-09-26 on the cursor seat: runs that thought for minutes
+    // MEASURED 2026-09-26 on a live session: runs that thought for minutes
     // were ended at 90 s with "made no progress (heartbeats only)". With no
     // tool call open, Cursor is not waiting on the bridge: its heartbeats say
     // the model is working.

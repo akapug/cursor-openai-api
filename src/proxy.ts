@@ -114,7 +114,7 @@ const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 
-// helm patch (2026-09-25): CURSOR_BRIDGE_TRACE=1 logs every server frame's
+// Patch (2026-09-25): CURSOR_BRIDGE_TRACE=1 logs every server frame's
 // case to stderr, so a stall can be read off the log instead of guessed at.
 const TRACE = process.env.CURSOR_BRIDGE_TRACE === "1";
 function trace(...parts: unknown[]): void {
@@ -235,15 +235,15 @@ interface CursorRequestPayload {
 }
 
 /**
- * helm patch (2026-09-30, task/3817): A CURSOR CONVERSATION KEPT BETWEEN THE
+ * Patch (2026-09-30): A CURSOR CONVERSATION KEPT BETWEEN THE
  * CLIENT'S TURNS. Cursor's own CLI keeps one conversation per chat: after
  * each step Cursor sends a checkpoint (conversationCheckpointUpdate), the CLI
  * stores it with the blobs Cursor wrote (KV setBlobArgs), and the next turn
  * sends that checkpoint back under the same conversation id with only the new
  * user message. This bridge used to throw the checkpoint away and replay the
  * whole client history into a new conversation (random id, every message a
- * root-prompt blob) at the start of every run. MEASURED on the cursor seat's
- * bridge.log: on that cold replay Cursor's count for the same ~140k history
+ * root-prompt blob) at the start of every run. MEASURED on a live session's
+ * bridge log: on that cold replay Cursor's count for the same ~140k history
  * swung 107k/214k/426k/905k, over its 256k window in 16 of 24 run starts,
  * and 13 of 15 turns over 256k made no tool call; mid-run it counted ~0.77x
  * of the estimate. A run that closes cleanly now leaves its conversation
@@ -266,7 +266,7 @@ interface KeptConversation {
 }
 
 /**
- * helm patch: WHICH CLIENT CONVERSATION A RUN HOLDS. A paused run is found by
+ * Patch: WHICH CLIENT CONVERSATION A RUN HOLDS. A paused run is found by
  * the tool-call ids it handed out (findPausedRun), and that alone cannot tell
  * a continuation from a REWRITE: Claude Code's autocompact keeps the last
  * tool call and its result after the summary, so the request after a
@@ -291,7 +291,7 @@ interface PendingExec {
   /** Decoded arguments JSON string for SSE tool_calls emission. */
   decodedArgs: string;
   /**
-   * helm patch (2026-09-28): the Cursor native exec this call stands for
+   * Patch (2026-09-28): the Cursor native exec this call stands for
    * (translateNative). Its answer is that native's own result (nativeFrames),
    * never an mcpResult.
    */
@@ -304,14 +304,15 @@ type Bridge = ReturnType<typeof spawnBridge>;
 /**
  * One live Cursor agent run, kept across the client's tool round trips.
  *
- * helm patch (2026-09-25): A RUN IS FOUND BY THE TOOL-CALL IDS IT HANDED OUT,
+ * Patch (2026-09-25): A RUN IS FOUND BY THE TOOL-CALL IDS IT HANDED OUT,
  * NEVER BY WHAT THE CONVERSATION LOOKS LIKE. The old key was a hash of the
  * model and the first 200 characters of the first user message. Claude Code
- * opens every conversation — the seat's own and each subagent's — with the
- * same <system-reminder> preamble, so a seat and all of its subagents shared
- * ONE key. A subagent's tool call overwrote the seat's paused bridge in the
- * map (the seat's bridge leaked, heartbeating on); the seat's tool result was
- * then fed to the SUBAGENT's run and its answer streamed to the wrong
+ * opens every conversation — the main one and each subagent's — with the
+ * same <system-reminder> preamble, so a session and all of its subagents
+ * shared ONE key. A subagent's tool call overwrote the main conversation's
+ * paused bridge in the map (that bridge leaked, heartbeating on); the main
+ * conversation's tool result was then fed to the SUBAGENT's run and its
+ * answer streamed to the wrong
  * conversation; and any fresh request under the same key ended whichever run
  * was paused there. A tool-call id is unique per call and comes back verbatim
  * with its result, so it is the real identity of "the run this result is for".
@@ -409,7 +410,7 @@ const keptConversations = new Map<string, KeptConversation>();
 const seams = { spawn: (accessToken: string): Bridge => spawnBridge(accessToken) };
 
 /**
- * helm patch (2026-09-27): THE CLIENT'S IDLE TIMEOUT. Bun.serve closes a
+ * Patch (2026-09-27): THE CLIENT'S IDLE TIMEOUT. Bun.serve closes a
  * connection that has carried no byte for this long, and 255 s is the most it
  * allows. MEASURED 2026-09-25: a turn stuck on an exec answer that never
  * reached Cursor was cut at 254 s as "unexpected EOF". Every watchdog window
@@ -464,7 +465,7 @@ const limits = {
    */
   pausedTtlMs: 15 * 60_000,
   /**
-   * helm patch (2026-09-25, 2026-09-27): while a client is attached, a run
+   * Patch (2026-09-25, 2026-09-27): while a client is attached, a run
    * that sends nothing for this long, not even a heartbeat, is a dead stream;
    * and a run with a tool call open that sends only heartbeats for this long
    * is stuck: MEASURED, Cursor heartbeats every 10 s exactly while it waits
@@ -474,7 +475,7 @@ const limits = {
    */
   stallMs: stallWindow(process.env.CURSOR_BRIDGE_STALL_MS),
   /**
-   * helm patch (2026-09-27): the longest the attached client may get no byte
+   * Patch (2026-09-27): the longest the attached client may get no byte
    * of its response. Past it Bun's idle timeout closes the connection as
    * "unexpected EOF", so the bridge ends the run first and says why.
    */
@@ -486,13 +487,13 @@ const limits = {
    */
   firstFrameMs: FIRST_FRAME_MS,
   /**
-   * helm patch (2026-09-29): how far into a file the bridge reads to fit a
+   * Patch (2026-09-29): how far into a file the bridge reads to fit a
    * native read to READ_BYTE_BOUND (fitToBytes). A window past it cannot be
    * proven to fit, so that read fails closed.
    */
   readScanBytes: 64 * 1024 * 1024,
   /**
-   * helm patch (2026-09-30, task/3817): kept Cursor conversations. A seat and
+   * Patch (2026-09-30): kept Cursor conversations. A session and
    * the subagents it spawns are one conversation each; a subagent's is never
    * continued once it returns, so the oldest go past this many.
    */
@@ -536,7 +537,7 @@ function spawnBridge(accessToken: string): {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
-    // helm patch (2026-09-25): the child says why it died; that line belongs
+    // Patch (2026-09-25): the child says why it died; that line belongs
     // in the bridge log, not in /dev/null.
     stderr: "inherit",
   });
@@ -611,10 +612,10 @@ export async function startProxy(
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
-    // helm patch (2026-09-25): LOOPBACK ONLY. The server takes no credential
-    // from its callers and spends the owner's Cursor account on every request;
+    // Patch (2026-09-25): LOOPBACK ONLY. The server takes no credential
+    // from its callers and spends the user's Cursor account on every request;
     // bound to 0.0.0.0 (MEASURED: `*:18315` in ss), anyone who could reach the
-    // machine could spend it. The only caller is the seat's local proxy.
+    // machine could spend it. The intended caller is a local proxy.
     hostname: "127.0.0.1",
     port,
     idleTimeout: IDLE_TIMEOUT_S, // max — Cursor responses can take 30s+
@@ -722,7 +723,7 @@ async function handleChatCompletion(
   const promptTokens = requestTokens(body.messages, tools, true);
   const mcpTools = buildMcpToolDefinitions(tools);
 
-  // helm patch (2026-09-16): TOOL RESULTS WERE SILENTLY DROPPED ON THE
+  // Patch (2026-09-16): TOOL RESULTS WERE SILENTLY DROPPED ON THE
   // STATELESS PATH, so the model saw its own tool call with no output and
   // concluded the tool was broken. Every request that reaches here carries
   // its whole conversation — tool calls and results included — as structured
@@ -736,7 +737,7 @@ async function handleChatCompletion(
     return payload;
   };
 
-  // helm patch (2026-09-30, task/3817): a request that extends a kept Cursor
+  // Patch (2026-09-30): a request that extends a kept Cursor
   // conversation by its reply and new user text sends Cursor only that text,
   // with the conversation's checkpoint; any other request replays its
   // history, and the log says why.
@@ -754,7 +755,7 @@ async function handleChatCompletion(
   return startRun(payload, accessToken, modelId, body.stream !== false, promptTokens);
 }
 
-// --- Kept Cursor conversations (helm patch 2026-09-30, task/3817) ---
+// --- Kept Cursor conversations (patch 2026-09-30) ---
 
 /**
  * One digest per prefix of the client's messages: chain[i] covers messages
@@ -905,11 +906,11 @@ interface ParsedMessages {
 }
 
 /**
- * helm patch (2026-09-16): CONTENT IS A STRING *OR* AN ARRAY OF BLOCKS, AND
+ * Patch (2026-09-16): CONTENT IS A STRING *OR* AN ARRAY OF BLOCKS, AND
  * THIS FILE ASSUMED STRING EVERYWHERE. parseMessages read `msg.content ?? ""`
  * directly, so an array reached the wire as the literal text "[object Object]".
  * Claude Code sends array-form content on essentially every message, so a real
- * seat's whole conversation — system prompt included — arrived at Cursor as
+ * session's whole conversation — system prompt included — arrived at Cursor as
  * that garbage string, and Cursor answered with Connect failed_precondition.
  * MEASURED: a single {type:"text"} block made the model reply "Looks like the
  * message didn't come through correctly ([object O…". Flatten to text here so
@@ -994,14 +995,14 @@ function parseToolArgs(args: string): unknown {
 }
 
 /**
- * helm patch (2026-09-25): HISTORY GOES TO CURSOR AS STRUCTURED MESSAGES.
+ * Patch (2026-09-25): HISTORY GOES TO CURSOR AS STRUCTURED MESSAGES.
  * The 2026-09-16 workaround folded every prior turn into one plain-text
  * transcript inside the new user message, because synthesised
  * ConversationTurnStructure turns drew failed_precondition. That fold kept
  * user and assistant TEXT only: every tool call vanished from the
  * transcript, and every tool result in the whole conversation was pasted in
  * a block at the top of the latest message, cut off from the call it
- * answered (ds4pro review F2). A Claude Code seat's history is mostly tool
+ * answered (review finding F2). A Claude Code session's history is mostly tool
  * calls, so each new user turn showed the model a garbled record of its own
  * work. Each prior message is now its own root-prompt blob, with tool calls
  * and tool results as typed parts in order; the latest user message is the
@@ -1134,7 +1135,7 @@ function buildCursorRequest(
 }
 
 /**
- * helm patch (2026-09-30, task/3817): continue a kept Cursor conversation.
+ * Patch (2026-09-30): continue a kept Cursor conversation.
  * The run request carries Cursor's own last checkpoint (fields this proto
  * cannot read ride along as they came) under the conversation's id, and only
  * the new user text as its action; Cursor asks for any blob it needs back
@@ -1208,20 +1209,19 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
   }
 }
 
-// helm patch (2026-09-16): CURSOR'S QUOTA REFUSAL MUST BE A 429, NOT TEXT.
+// Patch (2026-09-16): CURSOR'S QUOTA REFUSAL MUST BE A 429, NOT TEXT.
 // A walled account answers with a Connect end-stream whose error.code is
 // resource_exhausted (unavailable has the same shape). Emitting that as
 // message content under HTTP 200 made every walled turn look like a finished
-// answer: the proxy never cooled the credential, helm never read a wall, and
-// the seat respawned reviewers that each died the same way (measured on the
-// cursor seat, 2026-09-16). The fresh-request path now PEEKS at the first
-// frame before committing to an SSE 200; a refusal there becomes a real 429
-// with Retry-After, which CLIProxyAPI cools on and helm surfaces as
-// PROXY-COOLDOWN.
+// answer: the proxy never cooled the credential, nothing upstream saw a wall, and
+// a client that spawned subagents kept spawning ones that each died the same
+// way (measured on a live session, 2026-09-16). The fresh-request path now
+// PEEKS at the first frame before committing to an SSE 200; a refusal there
+// becomes a real 429 with Retry-After, which CLIProxyAPI cools on.
 //
-// helm patch (2026-09-26): THE RESUME PATH WAITS FOR ITS FIRST FRAME TOO, AND
-// NO CONNECT ERROR IS EVER REPLY TEXT. MEASURED on the cursor seat: the
-// request carrying the owner's tool results resumed a paused run, which
+// Patch (2026-09-26): THE RESUME PATH WAITS FOR ITS FIRST FRAME TOO, AND
+// NO CONNECT ERROR IS EVER REPLY TEXT. MEASURED on a live session: the
+// request carrying the user's tool results resumed a paused run, which
 // answered 200 at once, so Cursor's `unavailable` reached Claude Code as the
 // reply "[Error: Connect error unavailable: Error]" and the turn ended there.
 // A resumed run now answers only after its first frame past heartbeats
@@ -1515,7 +1515,7 @@ function handleExecMessage(
     return;
   }
 
-  // helm patch (2026-09-25): CURSOR ASKS FOR MCP STATE BEFORE IT RUNS AN MCP
+  // Patch (2026-09-25): CURSOR ASKS FOR MCP STATE BEFORE IT RUNS AN MCP
   // TOOL, AND THE VENDORED PROTO CANNOT READ THE QUESTION. MEASURED on
   // grok-4.7-high: after toolCallStarted the server sends an exec on field 36
   // (mcp_state_exec_args, provider "opencode"), which this proto decodes with
@@ -1549,14 +1549,14 @@ function handleExecMessage(
     return;
   }
 
-  // helm patch (2026-09-28): A CURSOR TOOL THE CALLER CAN RUN IS RUN AS THE
+  // Patch (2026-09-28): A CURSOR TOOL THE CALLER CAN RUN IS RUN AS THE
   // CALLER'S TOOL, NEVER REFUSED. MEASURED with CURSOR_BRIDGE_TRACE=1:
   // grok-4.7-high opens a turn with Cursor's own read. In a short
   // conversation it followed the refusal's prose (readArgs, refused, the
-  // field-36 MCP-state exec, mcpArgs opencode-Read). In a Claude Code seat's
+  // field-36 MCP-state exec, mcpArgs opencode-Read). In a Claude Code session's
   // ~100k-token conversation it did not: it wrote text and ended the turn with
   // no tool call. Once "the tool runtime refused every call" was in its
-  // history, every later turn gave up the same way for 30 hours, and the seat
+  // history, every later turn gave up the same way for 30 hours, and the session
   // looked idle until its context was cleared. A refusal works only while the
   // model obeys prose, and one miss poisons the session. So a native whose
   // caller tool is registered goes to the client as that tool's call, the way
@@ -1632,7 +1632,7 @@ function handleExecMessage(
       reason: REJECT_REASON,
       isReadonly: false,
     });
-    // helm patch (2026-09-25): A STREAMED SHELL IS ANSWERED ON THE STREAM
+    // Patch (2026-09-25): A STREAMED SHELL IS ANSWERED ON THE STREAM
     // CHANNEL. shell_stream_args expects ExecClientMessage.shell_stream (a
     // ShellStream event); this sent shell_result, which Cursor does not read
     // for that exec, so it waited on an answer that never came. MEASURED on
@@ -1703,8 +1703,8 @@ function handleExecMessage(
 }
 
 /**
- * helm patch (2026-09-26): A REFUSED CURSOR TOOL NAMES THE ROUTE TO THE
- * CALLER'S TOOL. MEASURED on the cursor seat: grok-4.7-high read "Tool not
+ * Patch (2026-09-26): A REFUSED CURSOR TOOL NAMES THE ROUTE TO THE
+ * CALLER'S TOOL. MEASURED on a live session: grok-4.7-high read "Tool not
  * available in this environment. Use the MCP tools provided instead." as the
  * end of the road and ended turns saying every command channel was
  * unavailable, although the same session had reached the caller's Bash
@@ -1729,13 +1729,13 @@ const NATIVE_TOOL_EQUIVALENT: Record<string, string[]> = {
 };
 
 /**
- * helm patch (2026-09-30, task/3817): THE CALLER'S TOOLS ARE NAMED IN CURSOR'S
+ * Patch (2026-09-30): THE CALLER'S TOOLS ARE NAMED IN CURSOR'S
  * OWN MCP INSTRUCTIONS, SO THE MODEL KNOWS THEM WITHOUT GetDynamicTools.
- * MEASURED on the cursor seat (transcript 46c53e63, 16:34-16:35Z): after a
+ * MEASURED on a live session (16:34-16:35Z): after a
  * compaction the model listed Cursor's own tools (Shell, Grep, StrReplace,
  * Write, Read, Glob, AskQuestion, GetDynamicTools, CallDynamicTool), decided
- * "the Monitor tool is unavailable in this Cursor session" and left its
- * beacon dead, although it had armed Monitor through CallDynamicTool five
+ * "the Monitor tool is unavailable in this Cursor session" and stopped
+ * using it, although it had armed Monitor through CallDynamicTool five
  * times that session and never called GetDynamicTools to look. The only other
  * place the route was written was the client's system prompt, which reaches
  * Cursor as one more root-prompt message. RequestContext.mcp_instructions is
@@ -1762,8 +1762,8 @@ function mcpInstructionsFor(mcpTools: McpToolDefinition[]) {
 }
 
 /**
- * helm patch (2026-10-21): A REFUSAL NAMES THE TOOL AND WHY. MEASURED on the
- * cursor seat: "Cursor's own tool is refused in this environment" read to
+ * Patch (2026-10-21): A REFUSAL NAMES THE TOOL AND WHY. MEASURED on a
+ * live session: "Cursor's own tool is refused in this environment" read to
  * the model as every native being refused, and it ended turns saying its
  * tools were down while its Bash worked. The answer names Cursor's tool,
  * the one reason it is not run here, and the route.
@@ -1803,7 +1803,7 @@ function rejectReason(execMsg: ExecServerMessage, mcpTools: McpToolDefinition[])
 }
 
 /**
- * helm patch (2026-09-25): THE TOOL-CALL ID THE CLIENT SEES MUST SURVIVE THE
+ * Patch (2026-09-25): THE TOOL-CALL ID THE CLIENT SEES MUST SURVIVE THE
  * ROUND TRIP. Cursor's ids carry a newline — MEASURED on grok-4.7-high:
  * "call-<uuid>-1\nfc_<uuid>_0". This bridge handed that id out raw;
  * CLIProxyAPI rewrites every character outside [A-Za-z0-9_-] to "_" on the
@@ -1848,7 +1848,7 @@ function execClientFrame(
   return frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage));
 }
 
-// --- Cursor's own tools, run as the caller's (helm patch 2026-09-28) ---
+// --- Cursor's own tools, run as the caller's (patch 2026-09-28) ---
 
 type NativeCase = "readArgs" | "shellArgs" | "shellStreamArgs" | "grepArgs" | "writeArgs" | "lsArgs" | "fetchArgs";
 type NativeArgs = ReadArgs | ShellArgs | GrepArgs | WriteArgs | LsArgs | FetchArgs;
@@ -2039,9 +2039,9 @@ const GREP_READERS: Record<string, (text: string, a: GrepArgs) => GrepUnionResul
 const LS_END = "-- end of listing --";
 
 /**
- * helm patch (2026-09-29): THE MOST OF A FILE ONE OF CURSOR'S READS BRINGS
+ * Patch (2026-09-29): THE MOST OF A FILE ONE OF CURSOR'S READS BRINGS
  * INTO THE CALLER'S CONTEXT: READ_BOUND lines, and READ_BYTE_BOUND bytes of
- * its text as the caller's Read prints it. MEASURED on the cursor seat's
+ * its text as the caller's Read prints it. MEASURED on a live session's
  * Claude Code transcript: each read went out as a Read with only file_path,
  * so Claude Code read the whole file (a 100,627-character module twice
  * within 2 s, then 53 KB and 99 KB more); the conversation went from about
@@ -2050,7 +2050,7 @@ const LS_END = "-- end of listing --";
  * lines is about 22 KB, and 24,000 bytes some 6,000 tokens by the bridge's
  * bytes-over-four estimate: room for a function and its neighbours, and a
  * dozen reads before a compaction where the whole file allowed two. Lines
- * alone do not bound a file of long lines (the seat's 99 KB WEB.md has 339),
+ * alone do not bound a file of long lines (a 99 KB Markdown page of 339 lines),
  * and MEASURED on Claude Code 2.1.284, its Read prints a 9,014-character
  * line whole, so the byte bound holds there.
  */
@@ -2093,14 +2093,14 @@ const readWant = (r: ReadRange): number => Math.min(r.limit ?? Infinity, READ_BO
  * client, which keeps its output in its conversation before the bridge sees
  * it, and Read takes no byte limit: the one lever on that side is how many
  * lines the Read asks for. So the bridge measures the file on its own disk
- * (the caller's disk, where the bridge runs beside the client as helm runs
- * it) and asks for no more lines than fit READ_BYTE_BOUND as Read prints
- * them. It reads the file only to count bytes; none of it goes to the client
+ * (the caller's disk, where the bridge is meant to run beside the client)
+ * and asks for no more lines than fit READ_BYTE_BOUND as Read prints them.
+ * It reads the file only to count bytes; none of it goes to the client
  * or to Cursor. A read whose fit it cannot prove (a relative path, which it
  * cannot place; a file not on its disk, not a regular file, or unreadable; a
  * window past limits.readScanBytes) FAILS CLOSED: the client is never called,
- * and the read's error names the route (readPlan). The seat's reads are all
- * absolute local paths, and Claude Code's Read takes only absolute paths.
+ * and the read's error names the route (readPlan). Claude Code's Read takes
+ * only absolute local paths, so none of its reads is a relative path.
  */
 const READ_SCAN_CHUNK = 1024 * 1024;
 
@@ -2396,10 +2396,10 @@ function grepAnswer(a: GrepArgs, tool: string, found: GrepUnionResult["result"] 
 }
 
 /**
- * helm patch (2026-10-21): A GREP WITH NO GREP TOOL RUNS AS THE CALLER'S BASH
- * RG. MEASURED: Claude Code 2.1.306 registers no Grep tool (the cursor seat's
+ * Patch (2026-10-21): A GREP WITH NO GREP TOOL RUNS AS THE CALLER'S BASH
+ * RG. MEASURED: Claude Code 2.1.306 registers no Grep tool (one live
  * session made 3,128 Bash calls and no Grep), so Cursor's own grep was
- * refused, and in the seat's ~135k-token conversation grok-4.7-high ended
+ * refused, and in that session's ~135k-token conversation grok-4.7-high ended
  * five turns in a row with "could not read the capture" and no tool call
  * (16:57-18:17Z), while a short conversation followed the refusal's route.
  * So a grep goes to the caller's Bash as one bounded rg command, with its
@@ -2539,7 +2539,7 @@ interface Usage {
   completion_tokens: number;
   total_tokens: number;
   /** Both counts are estimates, UTF-8 bytes over four (usageOf). */
-  helm_usage: "estimate";
+  usage_source: "estimate";
 }
 
 /** Where a run's output goes while a client request is attached to it. */
@@ -2712,7 +2712,7 @@ function feed(run: Run, chunk: Buffer): void {
 }
 
 /**
- * helm patch (2026-09-27): WHETHER CURSOR WAITS ON THE BRIDGE IS CURSOR'S OWN
+ * Patch (2026-09-27): WHETHER CURSOR WAITS ON THE BRIDGE IS CURSOR'S OWN
  * BOOKKEEPING. MEASURED in the bridge's trace of 2026-09-25: each of the 38
  * tool calls opened with toolCallStarted before its exec, and each exec the
  * bridge answered was followed by toolCallCompleted within 100 ms. The one
@@ -2728,9 +2728,9 @@ function trackToolCalls(run: Run, msg: AgentServerMessage): void {
 }
 
 /**
- * helm patch (2026-10-21, task/10865): A CONVERSATION WHOSE TOOLS CURSOR
- * REPORTS UNAVAILABLE IS NOT KEPT. MEASURED on the cursor seat (bridge.log
- * runs 8-9 on conversation c7d1a521, transcript 46c53e63 21:40-21:42Z): after
+ * Patch (2026-10-21): A CONVERSATION WHOSE TOOLS CURSOR
+ * REPORTS UNAVAILABLE IS NOT KEPT. MEASURED on a live session (bridge log
+ * runs 8-9 of one conversation, 21:40-21:42Z): after
  * an upstream blip, two runs continuing a kept conversation ended with the
  * model saying its shell and Read "returned Tool not available". No exec for
  * those calls reached the bridge (no native refusal logged, no tool call sent
@@ -2742,7 +2742,7 @@ function trackToolCalls(run: Run, msg: AgentServerMessage): void {
  * own (toolCallCompleted). A run marked so that sent the bridge no tool exec
  * at all is not kept (keepConversation), and the next request replays. The
  * run itself is not retried: its reply already went to the client. A reply
- * that only quotes the phrase (a seat discussing this) also drops the keep;
+ * that only quotes the phrase (a session discussing this) also drops the keep;
  * that costs one replay, accepted. CURSOR_BRIDGE_TOOL_UNAVAILABLE moves the
  * phrase if Cursor rewords it.
  */
@@ -3143,29 +3143,30 @@ function requestTokens(
 
 /**
  * The usage a response reports. Claude Code reads it as the size of its
- * conversation: its auto-compact counts input plus output, and helm's
- * autocompact counts the input.
+ * conversation: its auto-compact counts input plus output, and a
+ * consumer that sizes the window from usage may count the input alone.
  *
- * helm patch (2026-09-25): every terminal chunk carries usage. A tool-call
- * turn, most turns of a Claude Code seat, used to carry none (task/2640).
+ * Patch (2026-09-25): every terminal chunk carries usage. A tool-call
+ * turn, most turns of a Claude Code session, used to carry none.
  *
- * helm patch (2026-09-27): USAGE DESCRIBES THE REQUEST, NEVER CURSOR'S COUNT
- * (task/3374). The 2026-09-26 patch reported Cursor's checkpoint count
+ * Patch (2026-09-27): USAGE DESCRIBES THE REQUEST, NEVER CURSOR'S COUNT.
+ * The 2026-09-26 patch reported Cursor's checkpoint count
  * (ConversationTokenDetails.used_tokens) and token_delta output. They count
  * Cursor's own conversation, which is not the one the client sent. MEASURED
- * on the cursor seat's transcripts:
+ * on a live session's transcripts:
  *  - one conversation, two fresh runs 87 minutes apart, 796 bytes of message
  *    text between them: 77,400, then 911,810, which is 3.6 times Cursor's own
- *    max_tokens of 256,000. helm read 474.9% of the 192,000 window. That
+ *    max_tokens of 256,000. The client's context meter read 474.9% of the
+ *    192,000 window. That
  *    build reported five counts above 256,000 in 21 hours, and a compaction
  *    followed each one within four minutes.
  *  - the first response of a fresh conversation: about 50,500 output tokens
  *    (ten conversations, 50,474 to 50,909) for a few hundred visible tokens
  *    in under 20 s. The next checkpoint rose about 47,000 (16,310 to 63,453)
- *    for 3.9 KB of new conversation. While it worked, the seat compacted
+ *    for 3.9 KB of new conversation. While it worked, the session compacted
  *    every 8 to 19 minutes.
  *
- * So both counts are ESTIMATES, and `helm_usage` says so. `prompt_tokens` is
+ * So both counts are ESTIMATES, and `usage_source` says so. `prompt_tokens` is
  * the attached request's size (`requestTokens`, taken again from every
  * request that resumes the run, since each one carries the whole
  * conversation). `completion_tokens` is the UTF-8 bytes of the text,
@@ -3180,7 +3181,7 @@ function usageOf(run: Run, sink: Sink): Usage {
     prompt_tokens: run.promptTokens,
     completion_tokens: output,
     total_tokens: run.promptTokens + output,
-    helm_usage: "estimate",
+    usage_source: "estimate",
   };
 }
 
@@ -3201,14 +3202,14 @@ function sseResponse(run: Run, then: () => void): Response {
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      // helm patch (2026-09-16): A CLIENT DISCONNECT USED TO KILL THE WHOLE
+      // Patch (2026-09-16): A CLIENT DISCONNECT USED TO KILL THE WHOLE
       // BRIDGE PROCESS. The `closed` flag only tracks OUR OWN closes, so when
       // the client hangs up mid-stream — pressing Esc in Claude Code is enough —
       // the runtime closes the controller underneath us, `closed` is still
       // false, and the next enqueue throws ERR_INVALID_STATE from inside a
       // bridge.onClose callback. Nothing catches it there, so bun exits and
-      // EVERY seat on this bridge starts getting ECONNREFUSED. MEASURED: the
-      // owner interrupted one turn and the bridge died with
+      // EVERY client of this bridge starts getting ECONNREFUSED. MEASURED: the
+      // user interrupted one turn and the bridge died with
       // "Invalid state: Controller is already closed" at the stop chunk.
       // A dead stream is a normal end of life, never a fatal error.
       let closed = false;
@@ -3218,7 +3219,7 @@ function sseResponse(run: Run, then: () => void): Response {
           controller.enqueue(encoder.encode(text));
           run.lastSentAt = performance.now();
         } catch (err) {
-          // helm patch (2026-09-16, ds4pro review F5): do NOT swallow silently.
+          // Patch (2026-09-16, review finding F5): do NOT swallow silently.
           // A closed controller is the ordinary end of a stream; anything else
           // is a real defect and used to be indistinguishable from it.
           const msg = err instanceof Error ? err.message : String(err);
@@ -3243,7 +3244,7 @@ function sseResponse(run: Run, then: () => void): Response {
         outputTokens: 0,
         text(text, isThinking) {
           sink.outBytes += utf8Bytes(text);
-          // helm patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD, NOT
+          // Patch (2026-09-16): REASONING IS A SEPARATE DELTA FIELD, NOT
           // FENCED TEXT. `reasoning_content` on the delta is the OpenAI
           // convention CLIProxyAPI maps to an Anthropic thinking block
           // (internal/translator/openai/claude/openai_claude_response.go);
@@ -3324,7 +3325,7 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
   const sink: Sink = {
     outBytes: 0,
     outputTokens: 0,
-    // helm patch (2026-08-11): thinking and answer are two streams; keep them
+    // Patch (2026-08-11): thinking and answer are two streams; keep them
     // apart. Measured: splicing them gave "I am Cursor G 4.5.rok.I am ...".
     text(text, isThinking) {
       sink.outBytes += utf8Bytes(text);
@@ -3366,6 +3367,6 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
   return promise;
 }
 
-// helm arm surface (2026-09-16): the first-frame peek and the refusal matcher
+// Test surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
 export const __test = { IDLE_TIMEOUT_S, IDLE_MARGIN_MS, stallWindow, requestTokens, handleChatCompletion, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages, seams, keptConversations, messageChain, continuation, buildContinuation, mcpInstructionsFor };

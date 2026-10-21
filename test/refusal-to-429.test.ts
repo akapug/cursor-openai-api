@@ -1,4 +1,4 @@
-// helm arm (2026-09-16): a Connect end-stream refusal on the FIRST frame must
+// Regression test (2026-09-16): a Connect end-stream refusal on the FIRST frame must
 // resolve the peek as a refusal (so the handler answers 429), a normal first
 // frame must not, and every byte seen during the peek must remain in `buf`.
 import { describe, expect, test } from "bun:test";

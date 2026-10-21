@@ -1,22 +1,22 @@
-// helm arm (2026-09-25): Cursor's own tools are refused so the model falls
+// Regression test (2026-09-25): Cursor's own tools are refused so the model falls
 // back to the caller's MCP tools, and each refusal must go out on the channel
 // that exec reads: a streamed shell (shell_stream_args) is answered with a
 // ShellStream event. Answering it with shell_result left Cursor waiting on
 // heartbeats until the HTTP idle timeout (measured: 254 s, "unexpected EOF").
 //
-// helm arm (2026-09-28): A CURSOR TOOL THE CALLER CAN RUN IS RUN, NEVER
+// Regression test (2026-09-28): A CURSOR TOOL THE CALLER CAN RUN IS RUN, NEVER
 // REFUSED. MEASURED with CURSOR_BRIDGE_TRACE=1: grok-4.7-high opens a turn
 // with Cursor's own read. The bridge refused it with prose that named the
 // caller's Read. In a short conversation the model followed the prose; in a
-// real Claude Code seat's ~100k-token conversation it wrote text and ended
+// real Claude Code session's ~100k-token conversation it wrote text and ended
 // the turn with no tool call. Once "the tool runtime refused every call" was
 // in its history, every later turn gave up the same way for 30 hours. A
 // native exec whose caller tool is registered now reaches the client as that
 // tool's call, and the client's output reaches Cursor as the native's own
 // result. Natives with no honest caller equivalent keep the refusal.
 //
-// helm arm (2026-09-29): A NATIVE READ BRINGS A BOUNDED NUMBER OF LINES INTO
-// THE CLIENT'S CONTEXT. MEASURED on the cursor seat's transcript: the model
+// Regression test (2026-09-29): A NATIVE READ BRINGS A BOUNDED NUMBER OF LINES INTO
+// THE CLIENT'S CONTEXT. MEASURED on a live session's transcript: the model
 // said it would read "in small slices", and each of Cursor's reads reached
 // Claude Code as a Read with only file_path, so Claude Code read the whole
 // file (a 100 KB module twice in 2 s, then 53 KB and 99 KB more). The
@@ -26,7 +26,7 @@
 // predates: they go out as Read's offset and limit, never more than the
 // bound, and a read the bound cut ends with the route to the rest.
 //
-// Review of that arm: the line bound alone still let a 339-line, 99 KB page
+// Review of that test: the line bound alone still let a 339-line, 99 KB page
 // or one huge line through whole, and a negative offset came back as the
 // file's first lines marked range_applied, the wrong slice as a success. The
 // client's Read output is what fills its context, and the bridge cannot
@@ -205,7 +205,7 @@ const BYTES = 24000;
 /** Real files for the reads the bridge measures on disk, and a path that is not there. */
 const DIR = mkdtempSync(join(tmpdir(), "bridge-read-bound-"));
 const ABSENT = join(DIR, "absent.py");
-/** A page of long lines: 339 lines of 291 characters, 99 KB, like the seat's WEB.md. */
+/** A page of long lines: 339 lines of 291 characters, 99 KB, like a real Markdown page. */
 const PAGE = join(DIR, "page.md");
 writeFileSync(PAGE, Array.from({ length: 339 }, () => "p".repeat(291) + "\n").join(""));
 /** One line of 100,000 bytes, then a short one. */
@@ -276,8 +276,8 @@ describe("native tool refusals", () => {
     expect(a.message.value.result.case).toBe("rejected");
   });
 
-  // helm arm (2026-09-26): A REFUSAL NAMES THE ROUTE. MEASURED on the cursor
-  // seat: grok-4.7-high read "Tool not available in this environment. Use the
+  // Regression test (2026-09-26): A REFUSAL NAMES THE ROUTE. MEASURED on a live
+  // session: grok-4.7-high read "Tool not available in this environment. Use the
   // MCP tools provided instead." as the end of the road and ended turns
   // saying every command channel was unavailable. Each refusal names the
   // caller's tool that does the same job, its server and the Cursor tool that
@@ -831,28 +831,28 @@ describe("a native read brings at most the bound's lines and bytes into the clie
   });
 });
 
-// helm arm (2026-10-21): A GREP WITH NO GREP TOOL RUNS AS THE CALLER'S BASH
-// RG, AND A REFUSAL NAMES THE TOOL AND WHY. MEASURED on the cursor seat:
+// Regression test (2026-10-21): A GREP WITH NO GREP TOOL RUNS AS THE CALLER'S BASH
+// RG, AND A REFUSAL NAMES THE TOOL AND WHY. MEASURED on a live session:
 // Claude Code 2.1.306 registers no Grep tool, so Cursor's own grep was
-// refused with "Cursor's own tool is refused in this environment"; in the
-// seat's ~135k-token conversation the model ended five turns in a row with
-// no tool call, then told meta that native calls were refused. The bridge
-// traced the same exec (grepArgs, no client call) with the seat's real tool
-// set. Nothing the bridge refused reached its log.
+// refused with "Cursor's own tool is refused in this environment"; in a
+// ~135k-token conversation the model ended five turns in a row with no
+// tool call, then told the user that native calls were refused. The bridge
+// traced the same exec (grepArgs, no client call) with that session's real
+// tool set. Nothing the bridge refused reached its log.
 describe("a grep with no Grep tool runs as the caller's Bash rg", () => {
-  const SEAT = () => tools("Bash", "Read", "Write", "Monitor");
+  const CLAUDE_CODE_TOOLS = () => tools("Bash", "Read", "Write", "Monitor");
 
   test("it reaches the client as one bounded rg command with its pattern, path and glob quoted", () => {
     const e = exec(20, "grepArgs", create(GrepArgsSchema, {
       pattern: "it's LANDED", path: "/tmp/a b/out.txt", glob: "*.output", caseInsensitive: true, contextAfter: 1, headLimit: 20,
     }));
-    const { sent, calls, args } = handled(e, SEAT());
+    const { sent, calls, args } = handled(e, CLAUDE_CODE_TOOLS());
     expect(sent.length).toBe(0);
     expect(calls.map((c) => c.toolName)).toEqual(["Bash"]);
     expect(args).toEqual([{ command:
       "timeout 120 rg --no-config --color=never --no-heading --with-filename -n -A 1 -i --glob '*.output' " +
       "-e 'it'\\''s LANDED' -- '/tmp/a b/out.txt' | head -n 20" }]);
-    const unbounded = handled(exec(21, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "files_with_matches" })), SEAT());
+    const unbounded = handled(exec(21, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "files_with_matches" })), CLAUDE_CODE_TOOLS());
     expect(unbounded.args[0]!.command).toBe("timeout 120 rg --no-config --color=never --no-heading --with-filename -l -e 'x' -- '.' | head -n 250");
   });
 
@@ -861,7 +861,7 @@ describe("a grep with no Grep tool runs as the caller's Bash rg", () => {
   });
 
   test("rg's lines reach Cursor as the grep's success, split by file with line numbers", async () => {
-    const { sent } = await roundTrip(SEAT(), [exec(23, "grepArgs", create(GrepArgsSchema, { pattern: "TODO", path: "src", context: 1 }))],
+    const { sent } = await roundTrip(CLAUDE_CODE_TOOLS(), [exec(23, "grepArgs", create(GrepArgsSchema, { pattern: "TODO", path: "src", context: 1 }))],
       ["src/a.ts-2-before\nsrc/a.ts:3:// TODO one\n--\nsrc/b.ts:10:x TODO\n"]);
     const grep = resultOf(sent, "exec-23").value.result;
     expect(grep.case).toBe("success");
@@ -873,15 +873,15 @@ describe("a grep with no Grep tool runs as the caller's Bash rg", () => {
   });
 
   test("no match, a files list and counts are the grep's success too", async () => {
-    const none = await roundTrip(SEAT(), [exec(24, "grepArgs", create(GrepArgsSchema, { pattern: "zzz" }))], ["(Bash completed with no output)"]);
+    const none = await roundTrip(CLAUDE_CODE_TOOLS(), [exec(24, "grepArgs", create(GrepArgsSchema, { pattern: "zzz" }))], ["(Bash completed with no output)"]);
     const empty = resultOf(none.sent, "exec-24").value.result;
     expect(empty.case).toBe("success");
     expect((Object.values(empty.value.workspaceResults)[0] as any).result.value.matches).toEqual([]);
-    const files = await roundTrip(SEAT(), [exec(25, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "files_with_matches" }))],
+    const files = await roundTrip(CLAUDE_CODE_TOOLS(), [exec(25, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "files_with_matches" }))],
       ["src/a.ts\nsrc/b.ts\n"]);
     const f = (Object.values(resultOf(files.sent, "exec-25").value.result.value.workspaceResults)[0] as any).result;
     expect([f.case, f.value.files, f.value.totalFiles]).toEqual(["files", ["src/a.ts", "src/b.ts"], 2]);
-    const counts = await roundTrip(SEAT(), [exec(26, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "count" }))],
+    const counts = await roundTrip(CLAUDE_CODE_TOOLS(), [exec(26, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "count" }))],
       ["src/a.ts:2\nsrc/b.ts:1"]);
     const c = (Object.values(resultOf(counts.sent, "exec-26").value.result.value.workspaceResults)[0] as any).result;
     expect([c.case, c.value.totalFiles, c.value.totalMatches]).toEqual(["count", 2, 3]);
@@ -890,7 +890,7 @@ describe("a grep with no Grep tool runs as the caller's Bash rg", () => {
   test("an rg error, a non-zero exit and a refused Bash are the grep's error carrying the words", async () => {
     const answers = ["rg: /nope: No such file or directory (os error 2)", "Exit code 2\nrg: regex parse error", "<tool_use_error>denied by hook</tool_use_error>"];
     for (const [i, out] of answers.entries()) {
-      const { sent } = await roundTrip(SEAT(), [exec(30 + i, "grepArgs", create(GrepArgsSchema, { pattern: "(" }))], [out]);
+      const { sent } = await roundTrip(CLAUDE_CODE_TOOLS(), [exec(30 + i, "grepArgs", create(GrepArgsSchema, { pattern: "(" }))], [out]);
       const grep = resultOf(sent, `exec-${30 + i}`).value.result;
       expect(grep.case).toBe("error");
       expect(grep.value.error).toContain(i === 2 ? "denied by hook" : out);
@@ -900,7 +900,7 @@ describe("a grep with no Grep tool runs as the caller's Bash rg", () => {
   test("a native the bridge refuses is answered with the tool and why, and the bridge log says so", () => {
     const log = spyOn(console, "error").mockImplementation(() => {});
     try {
-      const del = reply(exec(40, "deleteArgs", create(DeleteArgsSchema, { path: "/tmp/x" })), SEAT());
+      const del = reply(exec(40, "deleteArgs", create(DeleteArgsSchema, { path: "/tmp/x" })), CLAUDE_CODE_TOOLS());
       expect(del.message.value.result.value.reason).toBe(refusal("Delete", "a delete has no caller tool that runs it", BASH_ROUTE));
       expect(log.mock.calls.map((c) => String(c[0]))).toContain(
         `[bridge] native deleteArgs refused: ${refusal("Delete", "a delete has no caller tool that runs it", BASH_ROUTE)}`);

@@ -1,4 +1,4 @@
-// helm arm (2026-09-25): Cursor asks for MCP state (exec field 36) before it
+// Regression test (2026-09-25): Cursor asks for MCP state (exec field 36) before it
 // runs an MCP tool. The bridge must answer on the same exec with field 36 =
 // success{servers:[{name, identifier, tools}]}; an unanswered query stalled
 // every grok-4.7 tool call until the h2 child's timer killed the stream.

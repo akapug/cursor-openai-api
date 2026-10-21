@@ -1,4 +1,4 @@
-// helm arm (2026-09-25): the bridge spends the owner's Cursor account and
+// Regression test (2026-09-25): the bridge spends the user's Cursor account and
 // takes no credential from its callers, so it listens on loopback only; a
 // failed model discovery is an error, never a made-up list; and the h2 child
 // refuses to start without the one client-version string the parent owns.

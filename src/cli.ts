@@ -67,12 +67,12 @@ async function cmdModels() {
 }
 
 async function cmdServe(port: number) {
-  // helm patch (2026-08-11): upstream cmdServe captured `creds.access` ONCE,
+  // Patch (2026-08-11): upstream cmdServe captured `creds.access` ONCE,
   // so a long-running serve outlived its access token and every request then
   // failed until a manual restart — the refresh helper existed but nothing in
   // the serve path called it. Re-read the store per request and refresh
   // through the stored refresh token when the access token is within 60s of
-  // expiry (or past it): one owner login, then the bridge keeps itself live.
+  // expiry (or past it): one login, then the bridge keeps itself live.
   const getAccessToken = async (): Promise<string> => {
     const c = getStoredCredentials();
     if (!c) throw new Error("Not logged in. Run `cursor-api login` first.");
@@ -163,7 +163,7 @@ async function main() {
       await cmdModels();
       break;
     case "serve": {
-      // helm patch (2026-08-11): the usage text and the README both advertise
+      // Patch (2026-08-11): the usage text and the README both advertise
       // `serve [port]`, but only $PORT was ever read — a positional port was
       // accepted in silence and ignored, so `serve 18330` bound 3000 and the
       // caller learned it only from the banner. Positional wins (it is the

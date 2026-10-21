@@ -1,6 +1,6 @@
-// helm arm (2026-09-25): a paused Cursor run is found by the tool-call ids it
+// Regression test (2026-09-25): a paused Cursor run is found by the tool-call ids it
 // handed out, never by what the conversation looks like. The old key (model +
-// first 200 chars of the first user message) was shared by a Claude Code seat
+// first 200 chars of the first user message) was shared by a Claude Code session
 // and every subagent it spawned, so their tool round trips crossed.
 import { afterEach, describe, expect, test } from "bun:test";
 import { fromBinary } from "@bufbuild/protobuf";
@@ -9,7 +9,7 @@ import { __test } from "../src/proxy";
 import { fakeBridge, frame, makeRun, mcpCall, readSse, textDelta } from "./helpers";
 
 const NO_PEEK = { buf: Buffer.alloc(0), refusal: null, closedCode: null };
-// Claude Code opens the seat's conversation and every subagent's the same way.
+// Claude Code opens the main conversation and every subagent's the same way.
 const OPENING = { role: "user" as const, content: "<system-reminder>same preamble for everyone</system-reminder>" };
 
 function started(id: number) {
@@ -122,11 +122,11 @@ describe("paused runs", () => {
   });
 
   test("a compacted conversation never resumes the run that holds the uncompacted one", async () => {
-    // MEASURED on the live seat: Claude Code's autocompact keeps the last
+    // MEASURED on a live session: Claude Code's autocompact keeps the last
     // tool call and its result after the summary, so the request after a
     // compaction answers the paused run's tool call. Resuming it kept Cursor
     // on the whole pre-compaction conversation: the compaction bought
-    // nothing, every turn still billed ~145k input, and the seat compacted
+    // nothing, every turn still billed ~145k input, and the session compacted
     // three times in eight minutes.
     const a = started(1);
     const opened = [OPENING, { role: "user" as const, content: "do the task" }];

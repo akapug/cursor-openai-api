@@ -1,22 +1,23 @@
-// helm arm (2026-09-25): every terminal chunk carries usage, so Claude Code's
+// Regression test (2026-09-25): every terminal chunk carries usage, so Claude Code's
 // autocompact sees a count on every turn. A tool-call turn used to carry none
-// and reached the client as 0/0 (task/2640).
+// and reached the client as 0/0.
 //
-// helm arm (2026-09-27): USAGE DESCRIBES THE REQUEST, NEVER CURSOR'S COUNT
-// (task/3374). Cursor's checkpoint count is the size of Cursor's own
-// conversation, and it is not the conversation Claude Code sent. MEASURED on
-// the cursor seat's transcripts, 2026-09-26 and 27 (UTC):
+// Regression test (2026-09-27): USAGE DESCRIBES THE REQUEST, NEVER CURSOR'S COUNT.
+// Cursor's checkpoint count is the size of Cursor's own conversation, and
+// it is not the conversation Claude Code sent. MEASURED on a live session's
+// transcripts, 2026-09-26 and 27 (UTC):
 //  - one conversation, two fresh runs 87 minutes apart, 796 bytes of message
 //    text between them: Cursor counted 77,400 and then 911,810, 3.6 times its
-//    own max_tokens of 256,000. helm read 474.9% of the 192,000 window and
-//    Claude Code's status line read "0% until auto-compact". Five readings
+//    own max_tokens of 256,000. The client's context meter read 474.9% of the
+//    192,000 window and Claude Code's status line read "0% until
+//    auto-compact". Five readings
 //    over 256,000 in the 21 hours that build ran (603,845, 367,162, 982,009,
 //    609,634, 911,810), each followed by a compaction within four minutes.
 //  - the first response of a fresh conversation reported about 50,500 output
 //    tokens (50,474 to 50,909, ten conversations) for a few hundred visible
 //    tokens, in under 20 s, and the next checkpoint rose about 47,000
 //    (16,310 to 63,453) while the conversation grew 3.9 KB. Claude Code adds
-//    output to input when it sizes its window. While it worked, the seat
+//    output to input when it sizes its window. While it worked, the session
 //    compacted every 8 to 19 minutes.
 // A response now reports an estimate of what the request carried (its
 // messages and tools, UTF-8 bytes over four) and of what the response carried
@@ -124,7 +125,7 @@ describe("usage, streamed", () => {
       prompt_tokens: estimate(messages),
       completion_tokens: Math.ceil(carried(s) / 4),
       total_tokens: estimate(messages) + Math.ceil(carried(s) / 4),
-      helm_usage: "estimate",
+      usage_source: "estimate",
     });
     expect(s.usage!.prompt_tokens as number).toBeLessThan(1000);
   });
@@ -146,7 +147,7 @@ describe("usage, streamed", () => {
     fb.close(0);
     const s = await readSse(resp as Response);
     expect(s.finish).toBe("stop");
-    expect(s.usage).toEqual({ prompt_tokens: estimate(messages), completion_tokens: 2, total_tokens: estimate(messages) + 2, helm_usage: "estimate" });
+    expect(s.usage).toEqual({ prompt_tokens: estimate(messages), completion_tokens: 2, total_tokens: estimate(messages) + 2, usage_source: "estimate" });
   });
 
   test("a tool-call turn carries usage, and its output is the tool call it carried", async () => {
@@ -160,7 +161,7 @@ describe("usage, streamed", () => {
       prompt_tokens: estimate(messages),
       completion_tokens: Math.ceil(carried(s) / 4),
       total_tokens: estimate(messages) + Math.ceil(carried(s) / 4),
-      helm_usage: "estimate",
+      usage_source: "estimate",
     });
   });
 
@@ -199,7 +200,7 @@ describe("usage, streamed", () => {
   });
 
   test("a compacted conversation reports its own small size, never the long one's", async () => {
-    const long: Msg[] = [...fresh("the seat's task"), { role: "assistant", content: "z".repeat(400_000) }, { role: "user", content: "go on" }];
+    const long: Msg[] = [...fresh("the session's task"), { role: "assistant", content: "z".repeat(400_000) }, { role: "user", content: "go on" }];
     const a = started(long);
     a.fb.feed(frame(checkpoint(141519)), frame(textDelta("ok")));
     a.fb.close(0);
@@ -250,7 +251,7 @@ describe("usage, non-streamed", () => {
     const m = body.choices[0]!.message;
     const out = Math.ceil((bytes(m.content) + bytes(m.reasoning_content ?? "")) / 4);
     expect(body.choices[0]!.finish_reason).toBe("stop");
-    expect(body.usage).toEqual({ prompt_tokens: estimate(messages), completion_tokens: out, total_tokens: estimate(messages) + out, helm_usage: "estimate" });
+    expect(body.usage).toEqual({ prompt_tokens: estimate(messages), completion_tokens: out, total_tokens: estimate(messages) + out, usage_source: "estimate" });
   });
 
   test("a tool-call answer counts its tool calls as output", async () => {

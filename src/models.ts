@@ -17,7 +17,7 @@ import {
 const CURSOR_BASE_URL = "https://api2.cursor.sh";
 /**
  * The Cursor CLI version this bridge presents, for model discovery here AND
- * for the agent stream (h2-bridge.mjs receives it in its config). helm patch
+ * for the agent stream (h2-bridge.mjs receives it in its config). Patch
  * (2026-09-25): the two files each carried their own string
  * (cli-2026.02.13-41ac335 here, cli-2026.01.09-231024f in the h2 child), so
  * the bridge introduced itself as two different clients. Measured: both
@@ -100,11 +100,11 @@ export async function fetchCursorUsableModels(
 /**
  * The models this account can use, from Cursor itself.
  *
- * helm patch (2026-09-25): NO SILENT FALLBACK LIST. On any discovery failure
+ * Patch (2026-09-25): NO SILENT FALLBACK LIST. On any discovery failure
  * this returned six hardcoded models (composer-2, claude-4-sonnet, gpt-4o...),
  * so a bridge that could not reach Cursor, or held a dead token, still
- * answered /v1/models with a plausible list, and bridge.sh's health check
- * (which asks exactly that endpoint) reported it up. A failure is an error.
+ * answered /v1/models with a plausible list, and a health check
+ * that asks exactly that endpoint reported it up. A failure is an error.
  */
 export async function getCursorModels(
   apiKey: string,
@@ -148,7 +148,7 @@ export function curlHeaderConfig(headers: Record<string, string>): string {
  * HTTP/2 transport via curl (Bun's node:http2 doesn't work with Cursor's API).
  * Writes request body to a temp file, invokes curl --http2, reads response.
  *
- * helm patch (2026-09-25): THE TOKEN NEVER RIDES ARGV. The headers, the
+ * Patch (2026-09-25): THE TOKEN NEVER RIDES ARGV. The headers, the
  * bearer among them, used to be `-H` arguments, and /proc/<pid>/cmdline is
  * readable by every local user for as long as curl runs. They go to curl on
  * stdin as a config (`-K -`) now, and curl runs without a shell.

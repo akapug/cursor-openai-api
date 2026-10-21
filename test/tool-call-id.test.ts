@@ -1,4 +1,4 @@
-// helm arm (2026-09-25): a Cursor tool-call id carries "\n"; CLIProxyAPI
+// Regression test (2026-09-25): a Cursor tool-call id carries "\n"; CLIProxyAPI
 // rewrites it to "_" before Claude Code sees it, and Claude Code sends the
 // rewritten id back. The bridge must hand out ids already in [A-Za-z0-9_-]
 // and match a returned id through the same function, so the tool RESULT

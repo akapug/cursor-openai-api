@@ -1,10 +1,10 @@
-// helm arm (2026-09-30, task/3817): CURSOR KEEPS ITS OWN CONVERSATION ACROSS
+// Regression test (2026-09-30): CURSOR KEEPS ITS OWN CONVERSATION ACROSS
 // THE CLIENT'S TURNS. Cursor's own CLI stores each checkpoint Cursor sends
 // (conversationCheckpointUpdate) with the blobs Cursor writes, and sends that
 // checkpoint back under the same conversation id with only the new user
 // message. The bridge threw the checkpoint away and replayed the whole
 // history into a new conversation (random id, every message a root-prompt
-// blob) at the start of every run. MEASURED on the cursor seat's bridge.log:
+// blob) at the start of every run. MEASURED on a live session's bridge log:
 // on that cold replay Cursor counted the same ~140k history 107k, 214k, 426k
 // or 905k, over its 256k window in 16 of 24 run starts, and 13 of 15 turns
 // over 256k made no tool call. A request that extends a kept conversation by
@@ -13,8 +13,8 @@
 // replays, and the bridge log says why.
 //
 // And the caller's tools are named in Cursor's MCP instructions on every run:
-// after a compaction the cursor seat decided "the Monitor tool is
-// unavailable" (it never called GetDynamicTools) and its beacon stayed dead.
+// after a compaction a live session decided "the Monitor tool is
+// unavailable" (it never called GetDynamicTools) and stopped using it.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
@@ -227,7 +227,7 @@ describe("a kept Cursor conversation", () => {
   });
 
   test("a continued run whose reply says its tools are not available is not kept, and the next turn replays", async () => {
-    // MEASURED 2026-10-21 on the cursor seat: after an upstream blip a kept
+    // MEASURED 2026-10-21 on a live session: after an upstream blip a kept
     // conversation answered "the shell returned Tool not available" with no
     // tool call reaching the bridge; kept, every later turn stayed toolless.
     await turn(FIRST, checkpointFrame("t1"), frame(textDelta("noted")));

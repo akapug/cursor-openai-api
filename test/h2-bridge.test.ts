@@ -1,4 +1,4 @@
-// helm arm (2026-09-25): the h2 child's lifetime belongs to the parent. It
+// Regression test (2026-09-25): the h2 child's lifetime belongs to the parent. It
 // used to kill itself 120 s after spawn (cutting every longer Cursor run to
 // an empty "stop"), and on stdin EOF it merely stopped reading, holding the
 // Cursor stream open. It must now leave promptly (and cleanly) on EOF.

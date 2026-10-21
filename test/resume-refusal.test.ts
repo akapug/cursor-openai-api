@@ -1,6 +1,6 @@
-// helm arm (2026-09-26): a Connect error Cursor sends while a client waits is
-// an ERROR the client retries, never reply text. MEASURED on the cursor seat:
-// the request that carried the owner's tool results resumed a paused run, the
+// Regression test (2026-09-26): a Connect error Cursor sends while a client waits is
+// an ERROR the client retries, never reply text. MEASURED on a live session:
+// the request that carried the user's tool results resumed a paused run, the
 // bridge had already answered 200, and Cursor's `unavailable` reached Claude
 // Code as the reply "[Error: Connect error unavailable: Error]", which ended
 // the turn. The fresh-request path already turned a first-frame refusal into
