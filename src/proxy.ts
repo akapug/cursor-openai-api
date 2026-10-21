@@ -390,6 +390,12 @@ interface Run {
   ended?: string | null;
   /** Bytes this run sent Cursor: the run request, then every answer (blobs, exec results). */
   sent?: { request: number; answers: number; blobs: number; blobBytes: number };
+  /** Set once Cursor sent this run an exec for a model's tool call (an MCP call or one of its own tools). */
+  reachedTools?: boolean;
+  /** Where this run showed TOOL_UNAVAILABLE (watchTools); a run so marked that reached no tool is never kept. */
+  toolless?: string | null;
+  /** The end of the reply text so far, short of TOOL_UNAVAILABLE, so a phrase split across deltas is still seen. */
+  said?: string;
 }
 
 /** Paused runs by the client-facing id of every tool call they await. */
@@ -850,14 +856,15 @@ function divergence(chain: string[]): string {
 
 /**
  * Keep a run's Cursor conversation for the client's next turn: only a run
- * that closed on its own, with no error, no tool call waiting, and a
- * checkpoint to send back. The reply it closed on is the message the next
+ * that closed on its own, with no error, no tool call waiting, its tools not
+ * reported unavailable (watchTools), and a checkpoint to send back. The reply it closed on is the message the next
  * request must carry at chain.length - 1 (continuation).
  */
 function keepConversation(run: Run): void {
   const why = run.ended ? `the bridge ended it (${run.ended})`
     : run.failure ? `Cursor ended it with ${run.failure.message}`
     : run.pauseAfterChunk || run.awaiting.length || run.queued.length ? "a tool call is still waiting"
+    : run.toolless && !run.reachedTools ? `Cursor reported tool unavailable (${run.toolless}, and no tool call of this run reached the bridge)`
     : !run.checkpoint ? "Cursor sent no checkpoint"
     : !run.chain || !run.conversationId ? "it has no client conversation"
     : "";
@@ -2665,6 +2672,7 @@ function feed(run: Run, chunk: Buffer): void {
         progressed = true;
       }
       trackToolCalls(run, msg);
+      watchTools(run, msg);
       processServerMessage(
         msg,
         run.blobStore,
@@ -2717,6 +2725,50 @@ function trackToolCalls(run: Run, msg: AgentServerMessage): void {
   const update = msg.message.value.message;
   if (update.case === "toolCallStarted") run.openTools.add(update.value.callId);
   else if (update.case === "toolCallCompleted") run.openTools.delete(update.value.callId);
+}
+
+/**
+ * helm patch (2026-10-21, task/10865): A CONVERSATION WHOSE TOOLS CURSOR
+ * REPORTS UNAVAILABLE IS NOT KEPT. MEASURED on the cursor seat (bridge.log
+ * runs 8-9 on conversation c7d1a521, transcript 46c53e63 21:40-21:42Z): after
+ * an upstream blip, two runs continuing a kept conversation ended with the
+ * model saying its shell and Read "returned Tool not available". No exec for
+ * those calls reached the bridge (no native refusal logged, no tool call sent
+ * to the client), so Cursor answered them itself. The conversation was kept
+ * all the same, each later turn continued it toolless, and a replay into a
+ * new conversation at 21:52Z restored the tools. The phrase is read where
+ * Cursor can carry it: the reply text (the only carrier seen; the incident
+ * had no trace) and the failed result of a tool call Cursor completed on its
+ * own (toolCallCompleted). A run marked so that sent the bridge no tool exec
+ * at all is not kept (keepConversation), and the next request replays. The
+ * run itself is not retried: its reply already went to the client.
+ */
+const TOOL_UNAVAILABLE = "tool not available";
+
+const jsonSafe = (_: string, v: unknown): unknown =>
+  typeof v === "bigint" ? String(v) : v instanceof Uint8Array ? undefined : v;
+
+function watchTools(run: Run, msg: AgentServerMessage): void {
+  const m = msg.message;
+  if (m.case === "execServerMessage") {
+    const c = m.value.message.case;
+    if (c === "mcpArgs" || (c && Object.hasOwn(NATIVE_TOOL_EQUIVALENT, c))) run.reachedTools = true;
+    return;
+  }
+  if (m.case !== "interactionUpdate" || run.toolless) return;
+  const u = m.value.message;
+  if (u.case === "textDelta") {
+    const said = (run.said ?? "") + u.value.text;
+    if (said.toLowerCase().includes(TOOL_UNAVAILABLE)) run.toolless = `its reply says "${TOOL_UNAVAILABLE}"`;
+    run.said = said.slice(1 - TOOL_UNAVAILABLE.length);
+  } else if (u.case === "toolCallCompleted") {
+    const tool = u.value.toolCall?.tool;
+    const result = (tool?.value as { result?: { result?: { case?: string; value?: unknown } } } | undefined)?.result?.result;
+    if (result?.case && result.case !== "success"
+      && (JSON.stringify(result.value, jsonSafe) ?? "").toLowerCase().includes(TOOL_UNAVAILABLE)) {
+      run.toolless = `its ${tool!.case} came back ${result.case} "${TOOL_UNAVAILABLE}"`;
+    }
+  }
 }
 
 /**
