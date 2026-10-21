@@ -29,6 +29,12 @@ import {
   SetBlobArgsSchema,
   RequestContextArgsSchema,
   McpToolDefinitionSchema,
+  InteractionUpdateSchema,
+  ToolCallCompletedUpdateSchema,
+  ToolCallSchema,
+  ShellToolCallSchema,
+  ShellResultSchema,
+  ShellRejectedSchema,
   type AgentRunRequest,
   type RequestContextResult,
 } from "../src/proto/agent_pb";
@@ -218,6 +224,80 @@ describe("a kept Cursor conversation", () => {
     expect(req.conversationId).not.toBe(id);
     expect(req.conversationState!.turns.length).toBe(0);
     expect(req.conversationState!.rootPromptMessagesJson.length).toBe(5);
+  });
+
+  test("a continued run whose reply says its tools are not available is not kept, and the next turn replays", async () => {
+    // MEASURED 2026-10-21 on the cursor seat: after an upstream blip a kept
+    // conversation answered "the shell returned Tool not available" with no
+    // tool call reaching the bridge; kept, every later turn stayed toolless.
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta("noted")));
+    const second: Msg[] = [...FIRST, { role: "assistant", content: "noted" }, { role: "user", content: "read the inbox" }];
+    const said = "The shell returned Tool not available three times.";
+    const two = await turn(second, checkpointFrame("t2"), frame(textDelta("The shell returned Tool not ava")), frame(textDelta("ilable three times.")));
+    expect(two.sse.content).toBe(said);
+    const id = runRequest(two.fb).req.conversationId;
+    expect(text(runRequest(two.fb).req)).toBe("read the inbox");
+    expect(__test.keptConversations.size).toBe(0);
+    expect(logged.some((l) => l.includes(`Cursor conversation ${id.slice(0, 8)} is not kept, since Cursor reported tool unavailable (its reply says "tool not available"`))).toBe(true);
+    const three = await turn([...second, { role: "assistant", content: said }, { role: "user", content: "try again" }], frame(textDelta("ok")));
+    const { req } = runRequest(three.fb);
+    expect(req.conversationId).not.toBe(id);
+    expect(req.conversationState!.turns.length).toBe(0);
+    expect(req.conversationState!.rootPromptMessagesJson.length).toBe(5);
+  });
+
+  test("a run whose own tool call Cursor completed as not available is not kept", async () => {
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta("noted")));
+    const refused = create(ShellRejectedSchema, { command: "ls", reason: "Tool not available" });
+    const completed = frame(create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, {
+          message: {
+            case: "toolCallCompleted",
+            value: create(ToolCallCompletedUpdateSchema, {
+              callId: "c1",
+              toolCall: create(ToolCallSchema, {
+                tool: { case: "shellToolCall", value: create(ShellToolCallSchema, { result: create(ShellResultSchema, { result: { case: "rejected", value: refused } }) }) },
+              }),
+            }),
+          },
+        }),
+      },
+    }));
+    const two = await turn([...FIRST, { role: "assistant", content: "noted" }, { role: "user", content: "run ls" }], checkpointFrame("t2"), completed, frame(textDelta("I could not run it.")));
+    const id = runRequest(two.fb).req.conversationId;
+    expect(__test.keptConversations.size).toBe(0);
+    expect(logged.some((l) => l.includes(`Cursor conversation ${id.slice(0, 8)} is not kept, since Cursor reported tool unavailable (its shellToolCall came back rejected "tool not available"`))).toBe(true);
+  });
+
+  test("a continued run with a checkpoint is kept, and so is one that quotes the phrase while its tool calls reach the client", async () => {
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta("noted")));
+    const second: Msg[] = [...FIRST, { role: "assistant", content: "noted" }, { role: "user", content: "next" }];
+    const two = await turn(second, checkpointFrame("t2"), frame(textDelta("ok")));
+    const id = runRequest(two.fb).req.conversationId;
+    expect(__test.keptConversations.size).toBe(1);
+
+    const third: Msg[] = [...second, { role: "assistant", content: "ok" }, { role: "user", content: "grep the log for it" }];
+    const pending = ask(third);
+    const fb = bridges.at(-1)!;
+    expect(runRequest(fb).req.conversationId).toBe(id);
+    fb.feed(checkpointFrame("t3"), frame(mcpCall(1, "call-1", "rg -n 'Tool not available' bridge.log")));
+    expect((await readSse(await pending)).finish).toBe("tool_calls");
+    const fourth: Msg[] = [...third,
+      { role: "assistant", content: null, tool_calls: [{ id: "call-1", type: "function", function: { name: "Bash", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call-1", content: "Tool not available" }];
+    const resumed = ask(fourth);
+    fb.feed(checkpointFrame("t4"), frame(textDelta("The log says Tool not available once.")));
+    fb.close(0);
+    await readSse(await resumed);
+    expect(__test.keptConversations.size).toBe(1);
+    expect(logged.some((l) => l.includes("tool unavailable"))).toBe(false);
+
+    const five = await turn([...fourth, { role: "assistant", content: "The log says Tool not available once." }, { role: "user", content: "thanks" }], frame(textDelta("welcome")));
+    const { req } = runRequest(five.fb);
+    expect(req.conversationId).toBe(id);
+    expect(text(req)).toBe("thanks");
   });
 
   test("the reminders Claude Code sends with a new prompt ride the new turn's text", async () => {
