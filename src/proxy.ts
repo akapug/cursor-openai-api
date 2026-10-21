@@ -1573,7 +1573,10 @@ function handleExecMessage(
   // so it falls back to our MCP tools (registered via RequestContext), and
   // the rejection names the route there (rejectReason). Only natives with no
   // honest caller equivalent (NATIVE_ROUTES) get here.
-  const REJECT_REASON = rejectReason(execCase, mcpTools);
+  const REJECT_REASON = rejectReason(execMsg, mcpTools);
+  if (execCase && Object.hasOwn(NATIVE_TOOL_EQUIVALENT, execCase)) {
+    console.error(`[bridge] native ${execCase} refused: ${REJECT_REASON}`);
+  }
 
   if (execCase === "readArgs") {
     const args = execMsg.message.value;
@@ -1751,13 +1754,45 @@ function mcpInstructionsFor(mcpTools: McpToolDefinition[]) {
   return [create(McpInstructionsSchema, { serverName: MCP_PROVIDER, instructions })];
 }
 
-function rejectReason(execCase: string | undefined, mcpTools: McpToolDefinition[]): string {
+/**
+ * helm patch (2026-10-21): A REFUSAL NAMES THE TOOL AND WHY. MEASURED on the
+ * cursor seat: "Cursor's own tool is refused in this environment" read to
+ * the model as every native being refused, and it ended turns saying its
+ * tools were down while its Bash worked. The answer names Cursor's tool,
+ * the one reason it is not run here, and the route.
+ */
+const CURSOR_TOOL: Record<string, string> = {
+  shellArgs: "Shell", shellStreamArgs: "Shell", backgroundShellSpawnArgs: "background Shell",
+  writeShellStdinArgs: "Shell stdin write", readArgs: "Read", lsArgs: "Ls", grepArgs: "Grep",
+  writeArgs: "Write", deleteArgs: "Delete", fetchArgs: "Fetch",
+};
+
+/** Why a native is not run as a caller tool here: the one reason, in words. */
+function refusalWhy(execMsg: ExecServerMessage, mcpTools: McpToolDefinition[]): string {
+  const { case: c, value } = execMsg.message;
+  const v = value as { isBackground?: boolean; fileBytes?: Uint8Array };
+  if (c === "backgroundShellSpawnArgs" || ((c === "shellArgs" || c === "shellStreamArgs") && v.isBackground)) {
+    return "a background shell is one Cursor addresses later by a shell id the caller's Bash never gives; run it with Bash and run_in_background";
+  }
+  if (c === "deleteArgs") return "a delete has no caller tool that runs it";
+  if (c === "writeShellStdinArgs") return "writing to a running shell's stdin has no caller tool";
+  if (c === "writeArgs" && v.fileBytes?.length) return "the caller's Write takes text, not raw bytes";
+  const wanted = c && Object.hasOwn(NATIVE_ROUTES, c) ? routesOf(c as NativeCase).map((r) => r.tool) : [];
+  const registered = new Set(mcpTools.map((t) => t.toolName || t.name));
+  const have = wanted.filter((t) => registered.has(t));
+  if (!wanted.length) return "it has no caller tool that runs it";
+  if (!have.length) return `this session registers no ${wanted.join(" or ")} tool`;
+  return `this session's ${have.join(" and ")} cannot take this call's arguments`;
+}
+
+function rejectReason(execMsg: ExecServerMessage, mcpTools: McpToolDefinition[]): string {
+  const execCase = execMsg.message.case;
   const registered = new Set(mcpTools.map((t) => t.toolName || t.name));
   const tool = (NATIVE_TOOL_EQUIVALENT[execCase ?? ""] ?? []).find((name) => registered.has(name));
   const route = tool
     ? `call the MCP tool "${tool}" on server "${MCP_PROVIDER}" with CallDynamicTool (namespace "${MCP_PROVIDER}", toolName "${tool}"); GetDynamicTools gives its schema`
     : `call a tool on MCP server "${MCP_PROVIDER}" with CallDynamicTool (namespace "${MCP_PROVIDER}"); GetDynamicTools lists them with their schemas`;
-  return `Cursor's own tool is refused in this environment, so do not stop here: ${route}.`;
+  return `Cursor's ${CURSOR_TOOL[execCase ?? ""] ?? execCase} is not run in this session: ${refusalWhy(execMsg, mcpTools)}. Do not stop here: ${route}.`;
 }
 
 /**
@@ -1816,6 +1851,8 @@ type ExecArgs<C extends NativeCase> = Extract<ExecServerMessage["message"], { ca
 interface NativeCall {
   case: NativeCase;
   args: NativeArgs;
+  /** The route that runs it: the native's own, or its fallback (NATIVE_FALLBACKS). */
+  route: NativeRoute<NativeArgs>;
 }
 
 /** One ExecClientMessage answer: its oneof case and value. */
@@ -2263,21 +2300,8 @@ const NATIVE_ROUTES: { [C in NativeCase]: NativeRoute<ExecArgs<C>> } = {
       },
     }),
     answer(a, out) {
-      const grep = (result: GrepResult["result"]): ExecAnswer[] => [{ case: "grepResult", value: create(GrepResultSchema, { result }) }];
       const o = outcome(out);
-      if (!o.ok) return grep({ case: "error", value: create(GrepErrorSchema, { error: o.why }) });
-      const found = GREP_READERS[grepMode(a)]?.(o.text, a);
-      if (!found) {
-        return grep({ case: "error", value: create(GrepErrorSchema, {
-          error: `The caller's Grep answered in a form the bridge cannot split into ${grepMode(a)} results; its whole answer:\n${o.text}`,
-        }) });
-      }
-      // Claude Code prints each path as the search was given it, so the
-      // workspace key is empty rather than a root the paths would be joined to.
-      return grep({ case: "success", value: create(GrepSuccessSchema, {
-        pattern: a.pattern, path: a.path ?? "", outputMode: grepMode(a),
-        workspaceResults: { "": create(GrepUnionResultSchema, { result: found }) },
-      }) });
+      return grepAnswer(a, "Grep", o.ok ? GREP_READERS[grepMode(a)]?.(o.text, a) ?? null : null, o.ok ? o.text : null, o.ok ? "" : o.why);
     },
   },
   writeArgs: {
@@ -2346,8 +2370,89 @@ const NATIVE_ROUTES: { [C in NativeCase]: NativeRoute<ExecArgs<C>> } = {
   },
 };
 
-function routeOf(c: NativeCase): NativeRoute<NativeArgs> {
-  return NATIVE_ROUTES[c] as NativeRoute<NativeArgs>;
+/** A native's routes in preference order: its own, then its fallback when it has one. */
+/** Cursor's grep result for what the caller's tool answered: its matches, or its error carrying the answer. */
+function grepAnswer(a: GrepArgs, tool: string, found: GrepUnionResult["result"] | null, text: string | null, why: string): ExecAnswer[] {
+  const grep = (result: GrepResult["result"]): ExecAnswer[] => [{ case: "grepResult", value: create(GrepResultSchema, { result }) }];
+  if (text === null) return grep({ case: "error", value: create(GrepErrorSchema, { error: why }) });
+  if (!found) {
+    return grep({ case: "error", value: create(GrepErrorSchema, {
+      error: `The caller's ${tool} answered in a form the bridge cannot split into ${grepMode(a)} results; its whole answer:\n${text}`,
+    }) });
+  }
+  // Claude Code prints each path as the search was given it, so the
+  // workspace key is empty rather than a root the paths would be joined to.
+  return grep({ case: "success", value: create(GrepSuccessSchema, {
+    pattern: a.pattern, path: a.path ?? "", outputMode: grepMode(a),
+    workspaceResults: { "": create(GrepUnionResultSchema, { result: found }) },
+  }) });
+}
+
+/**
+ * helm patch (2026-10-21): A GREP WITH NO GREP TOOL RUNS AS THE CALLER'S BASH
+ * RG. MEASURED: Claude Code 2.1.306 registers no Grep tool (the cursor seat's
+ * session made 3,128 Bash calls and no Grep), so Cursor's own grep was
+ * refused, and in the seat's ~135k-token conversation grok-4.7-high ended
+ * five turns in a row with "could not read the capture" and no tool call
+ * (16:57-18:17Z), while a short conversation followed the refusal's route.
+ * So a grep goes to the caller's Bash as one bounded rg command, with its
+ * path, pattern and globs quoted, and rg's own output is read back into
+ * Cursor's grep result. At most GREP_BOUND lines come back, as Claude Code's
+ * Grep bounds its own; an rg error is the grep's error carrying its words.
+ */
+const GREP_BOUND = 250;
+const GREP_TIMEOUT_S = 120;
+/** What Claude Code's Bash answers for a command that printed nothing. */
+const BASH_NO_OUTPUT = "(Bash completed with no output)";
+const RG_MODE_FLAGS: Record<string, string[]> = { content: ["-n"], files_with_matches: ["-l"], count: ["-c"] };
+
+/** The one rg command a native grep runs as, or null for an output mode rg has no flag for. */
+function rgCommand(a: GrepArgs): CallerArgs | null {
+  const mode = RG_MODE_FLAGS[grepMode(a)];
+  if (!mode) return null;
+  const context = grepMode(a) !== "content" ? [] : ([["-B", a.contextBefore], ["-A", a.contextAfter], ["-C", a.context]] as const)
+    .flatMap(([flag, n]) => (n === undefined ? [] : [flag, String(n)]));
+  const words = [
+    "timeout", String(GREP_TIMEOUT_S), "rg", "--no-config", "--color=never", "--no-heading", "--with-filename", ...mode, ...context,
+    ...(a.caseInsensitive ? ["-i"] : []),
+    ...(a.multiline ? ["-U", "--multiline-dotall"] : []),
+    ...(a.type ? ["--type", shellWord(a.type)] : []),
+    ...(a.glob ? ["--glob", shellWord(a.glob)] : []),
+    "-e", shellWord(a.pattern), "--", shellWord(a.path || "."),
+    "|", "head", "-n", String(Math.min(a.headLimit || GREP_BOUND, GREP_BOUND)),
+  ];
+  return { need: { command: words.join(" ") } };
+}
+
+/** rg's own lines read into Cursor's grep result, per output mode; null when a line does not read. */
+const RG_READERS: Record<string, (text: string, a: GrepArgs) => GrepUnionResult["result"] | null> = {
+  content: (text, a) => GREP_READERS.content!(text, a),
+  count: (text, a) => GREP_READERS.count!(text, a),
+  files_with_matches(text) {
+    const files = text.split("\n").filter(Boolean);
+    return { case: "files", value: create(GrepFilesResultSchema, files.length ? { files, totalFiles: files.length } : {}) };
+  },
+};
+
+const GREP_VIA_BASH: NativeRoute<GrepArgs> = {
+  tool: "Bash",
+  carriesText: false,
+  call: rgCommand,
+  answer(a, out) {
+    const o = outcome(out);
+    if (!o.ok) return grepAnswer(a, "Bash", null, null, o.why);
+    const { code, text } = exitStatus(o.text);
+    const body = text.trim() === BASH_NO_OUTPUT ? "" : text;
+    const readable = !code && !body.split("\n").some((l) => l.startsWith("rg: "));
+    return grepAnswer(a, "Bash", readable ? RG_READERS[grepMode(a)]!(body, a) : null, o.text, "");
+  },
+};
+
+/** A native's second route, taken when the caller registers no tool for its first. */
+const NATIVE_FALLBACKS: { [C in NativeCase]?: NativeRoute<ExecArgs<C>> } = { grepArgs: GREP_VIA_BASH };
+
+function routesOf(c: NativeCase): NativeRoute<NativeArgs>[] {
+  return [NATIVE_ROUTES[c], NATIVE_FALLBACKS[c]].filter(Boolean) as NativeRoute<NativeArgs>[];
 }
 
 /**
@@ -2375,32 +2480,34 @@ function fitSchema(tool: McpToolDefinition, args: CallerArgs): Record<string, un
 function translateNative(execMsg: ExecServerMessage, mcpTools: McpToolDefinition[]): PendingExec | Buffer[] | null {
   const { case: c, value } = execMsg.message;
   if (!c || !Object.hasOwn(NATIVE_ROUTES, c)) return null;
-  const route = routeOf(c as NativeCase);
-  const tool = mcpTools.find((t) => (t.toolName || t.name) === route.tool);
-  if (!tool) return null;
-  const call = route.call(value as NativeArgs);
-  if (call && "answer" in call) {
-    trace(`native ${c} is answered by the bridge, with no call to the caller's ${route.tool}`);
-    return answerFrames(route, { id: execMsg.id, execId: execMsg.execId }, call.answer);
+  for (const route of routesOf(c as NativeCase)) {
+    const tool = mcpTools.find((t) => (t.toolName || t.name) === route.tool);
+    if (!tool) continue;
+    const call = route.call(value as NativeArgs);
+    if (call && "answer" in call) {
+      console.error(`[bridge] native ${c} answered by the bridge with its error, no call to the caller's ${route.tool}`);
+      return answerFrames(route, { id: execMsg.id, execId: execMsg.execId }, call.answer);
+    }
+    const args = call && fitSchema(tool, call);
+    if (!args) continue;
+    const cursorToolCallId = (value as NativeArgs).toolCallId || crypto.randomUUID();
+    trace(`native ${c} runs as the caller's ${route.tool}`);
+    return {
+      execId: execMsg.execId,
+      execMsgId: execMsg.id,
+      toolCallId: clientToolCallId(cursorToolCallId),
+      cursorToolCallId,
+      toolName: route.tool,
+      decodedArgs: JSON.stringify(args),
+      native: { case: c as NativeCase, args: value as NativeArgs, route },
+    };
   }
-  const args = call && fitSchema(tool, call);
-  if (!args) return null;
-  const cursorToolCallId = (value as NativeArgs).toolCallId || crypto.randomUUID();
-  trace(`native ${c} runs as the caller's ${route.tool}`);
-  return {
-    execId: execMsg.execId,
-    execMsgId: execMsg.id,
-    toolCallId: clientToolCallId(cursorToolCallId),
-    cursorToolCallId,
-    toolName: route.tool,
-    decodedArgs: JSON.stringify(args),
-    native: { case: c as NativeCase, args: value as NativeArgs },
-  };
+  return null;
 }
 
 /** Cursor's answer to a translated native: its own result for the client's output. */
 function nativeFrames(exec: PendingExec, out: string | undefined, note: string): Buffer[] {
-  const route = routeOf(exec.native!.case);
+  const route = exec.native!.route;
   const sent = JSON.parse(exec.decodedArgs) as Record<string, unknown>;
   return answerFrames(route, { id: exec.execMsgId, execId: exec.execId }, route.answer(exec.native!.args, out, note, sent));
 }
@@ -2824,7 +2931,7 @@ function resumeRun(
   // translated native's result carries it only where the native's answer has
   // text (NativeRoute.carriesText): a listing, a grep or a write has none.
   const carries = (i: number): boolean => answered[i] !== undefined
-    && (!run.awaiting[i]!.native || routeOf(run.awaiting[i]!.native!.case).carriesText);
+    && (!run.awaiting[i]!.native || run.awaiting[i]!.native!.route.carriesText);
   let last = answered.length - 1;
   while (last >= 0 && !carries(last)) last--;
   if (userText && last < 0) {

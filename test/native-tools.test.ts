@@ -41,7 +41,7 @@
 // lines, so a 100 KB line there reached the client whole. Such a read now
 // FAILS CLOSED: its error names the route (the absolute path, or sed -n
 // through the Shell tool), and the client is never called.
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { create, fromBinary, fromJson, toBinary } from "@bufbuild/protobuf";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -254,8 +254,12 @@ function rangeApplied(success: { $unknown?: Array<{ no: number; data: Uint8Array
   return f && [...f.data];
 }
 
-const NO_ROUTE = `Cursor's own tool is refused in this environment, so do not stop here: call a tool on MCP server "opencode" with CallDynamicTool (namespace "opencode"); GetDynamicTools lists them with their schemas.`;
-const BASH_ROUTE = `Cursor's own tool is refused in this environment, so do not stop here: call the MCP tool "Bash" on server "opencode" with CallDynamicTool (namespace "opencode", toolName "Bash"); GetDynamicTools gives its schema.`;
+const ANY_ROUTE = `call a tool on MCP server "opencode" with CallDynamicTool (namespace "opencode"); GetDynamicTools lists them with their schemas`;
+const BASH_ROUTE = `call the MCP tool "Bash" on server "opencode" with CallDynamicTool (namespace "opencode", toolName "Bash"); GetDynamicTools gives its schema`;
+/** A refusal as the model reads it: Cursor's tool, the one reason, and the route. */
+const refusal = (tool: string, why: string, route: string): string =>
+  `Cursor's ${tool} is not run in this session: ${why}. Do not stop here: ${route}.`;
+const BACKGROUND = "a background shell is one Cursor addresses later by a shell id the caller's Bash never gives; run it with Bash and run_in_background";
 
 describe("native tool refusals", () => {
   test("a streamed shell is refused with a ShellStream rejected event", () => {
@@ -319,20 +323,20 @@ describe("native tool refusals", () => {
     const grep = reply(exec(7, "grepArgs", create(GrepArgsSchema, { pattern: "TODO" })), mcp);
     expect(grep.message.case).toBe("grepResult");
     expect(grep.message.value.result.case).toBe("error");
-    expect(grep.message.value.result.value.error).toBe(NO_ROUTE);
+    expect(grep.message.value.result.value.error).toBe(refusal("Grep", "this session registers no Grep or Bash tool", ANY_ROUTE));
     const shell = answer("shellArgs", mcp).message.value.result;
     expect(shell.case).toBe("rejected");
     expect([shell.value.command, shell.value.workingDirectory, shell.value.reason, shell.value.isReadonly])
-      .toEqual(["echo hi", "/tmp", NO_ROUTE, false]);
+      .toEqual(["echo hi", "/tmp", refusal("Shell", "this session registers no Bash tool", ANY_ROUTE), false]);
     const read = reply(exec(8, "readArgs", create(ReadArgsSchema, { path: "/tmp/x" })), mcp);
-    expect(read.message.value.result.value).toMatchObject({ path: "/tmp/x", reason: NO_ROUTE });
+    expect(read.message.value.result.value).toMatchObject({ path: "/tmp/x", reason: refusal("Read", "this session registers no Read tool", ANY_ROUTE) });
   });
 
   test("a delete stays refused with the existing reason, even with Bash registered", () => {
     const del = reply(exec(9, "deleteArgs", create(DeleteArgsSchema, { path: "/tmp/x" })), tools("Bash", "Read", "Write"));
     expect(del.message.case).toBe("deleteResult");
     expect(del.message.value.result.case).toBe("rejected");
-    expect(del.message.value.result.value).toMatchObject({ path: "/tmp/x", reason: BASH_ROUTE });
+    expect(del.message.value.result.value).toMatchObject({ path: "/tmp/x", reason: refusal("Delete", "a delete has no caller tool that runs it", BASH_ROUTE) });
   });
 
   test("a read with Bash but no Read registered stays refused and names Bash; it is never run as cat", () => {
@@ -342,7 +346,7 @@ describe("native tool refusals", () => {
     const read = clientMessage(sent[0]!).value.message;
     expect(read.case).toBe("readResult");
     expect(read.value.result.case).toBe("rejected");
-    expect(read.value.result.value.reason).toBe(BASH_ROUTE);
+    expect(read.value.result.value.reason).toBe(refusal("Read", "this session registers no Read tool", BASH_ROUTE));
   });
 
   test("a fetch with Bash but no WebFetch registered stays refused", () => {
@@ -355,7 +359,7 @@ describe("native tool refusals", () => {
     const { sent, calls } = handled(exec(13, "shellArgs",
       create(ShellArgsSchema, { command: "npm run dev", isBackground: true })), tools("Bash"));
     expect(calls).toEqual([]);
-    expect(clientMessage(sent[0]!).value.message.value.result.value.reason).toBe(BASH_ROUTE);
+    expect(clientMessage(sent[0]!).value.message.value.result.value.reason).toBe(refusal("Shell", BACKGROUND, BASH_ROUTE));
   });
 
   test("a write of raw bytes stays refused: the caller's Write takes text", () => {
@@ -824,5 +828,86 @@ describe("a native read brings at most the bound's lines and bytes into the clie
     expect(content.endsWith("\n\n<user_message>\nstop and summarize\n</user_message>")).toBe(true);
     expect(content.indexOf("sed -n")).toBeGreaterThan(text.length);
     expect(content.indexOf("sed -n")).toBeLessThan(content.indexOf("<user_message>"));
+  });
+});
+
+// helm arm (2026-10-21): A GREP WITH NO GREP TOOL RUNS AS THE CALLER'S BASH
+// RG, AND A REFUSAL NAMES THE TOOL AND WHY. MEASURED on the cursor seat:
+// Claude Code 2.1.306 registers no Grep tool, so Cursor's own grep was
+// refused with "Cursor's own tool is refused in this environment"; in the
+// seat's ~135k-token conversation the model ended five turns in a row with
+// no tool call, then told meta that native calls were refused. The bridge
+// traced the same exec (grepArgs, no client call) with the seat's real tool
+// set. Nothing the bridge refused reached its log.
+describe("a grep with no Grep tool runs as the caller's Bash rg", () => {
+  const SEAT = () => tools("Bash", "Read", "Write", "Monitor");
+
+  test("it reaches the client as one bounded rg command with its pattern, path and glob quoted", () => {
+    const e = exec(20, "grepArgs", create(GrepArgsSchema, {
+      pattern: "it's LANDED", path: "/tmp/a b/out.txt", glob: "*.output", caseInsensitive: true, contextAfter: 1, headLimit: 20,
+    }));
+    const { sent, calls, args } = handled(e, SEAT());
+    expect(sent.length).toBe(0);
+    expect(calls.map((c) => c.toolName)).toEqual(["Bash"]);
+    expect(args).toEqual([{ command:
+      "timeout 120 rg --no-config --color=never --no-heading --with-filename -n -A 1 -i --glob '*.output' " +
+      "-e 'it'\\''s LANDED' -- '/tmp/a b/out.txt' | head -n 20" }]);
+    const unbounded = handled(exec(21, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "files_with_matches" })), SEAT());
+    expect(unbounded.args[0]!.command).toBe("timeout 120 rg --no-config --color=never --no-heading --with-filename -l -e 'x' -- '.' | head -n 250");
+  });
+
+  test("a Grep that is registered still runs as Grep", () => {
+    expect(handled(exec(22, "grepArgs", create(GrepArgsSchema, { pattern: "x" })), tools("Grep", "Bash")).calls.map((c) => c.toolName)).toEqual(["Grep"]);
+  });
+
+  test("rg's lines reach Cursor as the grep's success, split by file with line numbers", async () => {
+    const { sent } = await roundTrip(SEAT(), [exec(23, "grepArgs", create(GrepArgsSchema, { pattern: "TODO", path: "src", context: 1 }))],
+      ["src/a.ts-2-before\nsrc/a.ts:3:// TODO one\n--\nsrc/b.ts:10:x TODO\n"]);
+    const grep = resultOf(sent, "exec-23").value.result;
+    expect(grep.case).toBe("success");
+    const content = (Object.values(grep.value.workspaceResults)[0] as any).result.value;
+    expect(content.matches.map((f: any) => [f.file, f.matches.map((m: any) => [m.lineNumber, m.content, m.isContextLine])])).toEqual([
+      ["src/a.ts", [[2, "before", true], [3, "// TODO one", false]]],
+      ["src/b.ts", [[10, "x TODO", false]]],
+    ]);
+  });
+
+  test("no match, a files list and counts are the grep's success too", async () => {
+    const none = await roundTrip(SEAT(), [exec(24, "grepArgs", create(GrepArgsSchema, { pattern: "zzz" }))], ["(Bash completed with no output)"]);
+    const empty = resultOf(none.sent, "exec-24").value.result;
+    expect(empty.case).toBe("success");
+    expect((Object.values(empty.value.workspaceResults)[0] as any).result.value.matches).toEqual([]);
+    const files = await roundTrip(SEAT(), [exec(25, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "files_with_matches" }))],
+      ["src/a.ts\nsrc/b.ts\n"]);
+    const f = (Object.values(resultOf(files.sent, "exec-25").value.result.value.workspaceResults)[0] as any).result;
+    expect([f.case, f.value.files, f.value.totalFiles]).toEqual(["files", ["src/a.ts", "src/b.ts"], 2]);
+    const counts = await roundTrip(SEAT(), [exec(26, "grepArgs", create(GrepArgsSchema, { pattern: "x", outputMode: "count" }))],
+      ["src/a.ts:2\nsrc/b.ts:1"]);
+    const c = (Object.values(resultOf(counts.sent, "exec-26").value.result.value.workspaceResults)[0] as any).result;
+    expect([c.case, c.value.totalFiles, c.value.totalMatches]).toEqual(["count", 2, 3]);
+  });
+
+  test("an rg error, a non-zero exit and a refused Bash are the grep's error carrying the words", async () => {
+    const answers = ["rg: /nope: No such file or directory (os error 2)", "Exit code 2\nrg: regex parse error", "<tool_use_error>denied by hook</tool_use_error>"];
+    for (const [i, out] of answers.entries()) {
+      const { sent } = await roundTrip(SEAT(), [exec(30 + i, "grepArgs", create(GrepArgsSchema, { pattern: "(" }))], [out]);
+      const grep = resultOf(sent, `exec-${30 + i}`).value.result;
+      expect(grep.case).toBe("error");
+      expect(grep.value.error).toContain(i === 2 ? "denied by hook" : out);
+    }
+  });
+
+  test("a native the bridge refuses is answered with the tool and why, and the bridge log says so", () => {
+    const log = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const del = reply(exec(40, "deleteArgs", create(DeleteArgsSchema, { path: "/tmp/x" })), SEAT());
+      expect(del.message.value.result.value.reason).toBe(refusal("Delete", "a delete has no caller tool that runs it", BASH_ROUTE));
+      expect(log.mock.calls.map((c) => String(c[0]))).toContain(
+        `[bridge] native deleteArgs refused: ${refusal("Delete", "a delete has no caller tool that runs it", BASH_ROUTE)}`);
+      const grep = reply(exec(41, "grepArgs", create(GrepArgsSchema, { pattern: "x" })), tools("Monitor"));
+      expect(grep.message.value.result.value.error).not.toContain("refused in this environment");
+    } finally {
+      log.mockRestore();
+    }
   });
 });
