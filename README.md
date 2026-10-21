@@ -22,6 +22,9 @@ agent session, such as Claude Code talking to it through
 
 ## NPM
 
+The npm package and the Docker image below are upstream's releases. To run
+this fork, clone it and follow [Development](#development).
+
 ```bash
 npm i -g cursor-openai-api
 
