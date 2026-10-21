@@ -397,6 +397,8 @@ interface Run {
   toolless?: string | null;
   /** The end of the reply text so far, short of TOOL_UNAVAILABLE, so a phrase split across deltas is still seen. */
   said?: string;
+  /** Set when this run replayed the whole history into a new Cursor conversation (not a continuation). */
+  replayed?: boolean;
 }
 
 /** Paused runs by the client-facing id of every tool call they await. */
@@ -405,6 +407,19 @@ let runSerial = 0;
 
 /** Kept Cursor conversations, by the last digest of the chain they answered. */
 const keptConversations = new Map<string, KeptConversation>();
+
+/** A toolless fresh replay whose history the client is asked, once, to compact (askCompaction). */
+interface CompactAsk {
+  run: number;
+  /** The toolless replay's request estimate (requestTokens). */
+  tokens: number;
+  /** The messages it replayed. */
+  messages: number;
+  at: number;
+}
+
+/** Compaction asks, by the last digest of the chain the toolless replay answered. */
+const compactAsks = new Map<string, CompactAsk>();
 
 /** The seam tests replace to run a scripted Cursor stream (startRun). */
 const seams = { spawn: (accessToken: string): Bridge => spawnBridge(accessToken) };
@@ -456,6 +471,38 @@ function stallWindow(
   return held;
 }
 
+/**
+ * Patch (2026-10-21): THE SMALLEST TOOLLESS FRESH REPLAY THE
+ * CLIENT IS ASKED TO COMPACT, in the bridge's own request estimate
+ * (requestTokens, the usage Claude Code reads). MEASURED on a live session's
+ * bridge log and transcript, 2026-10-21: fresh replays of 376-380
+ * messages (638.0-641.4 KB of blobs, 153,729-154,527 estimated tokens) came
+ * back toolless at 22:57-23:10Z, a 360-message replay (615.1 KB, 148,182)
+ * kept its tools at 21:52Z, and after a hand /compact a 5-message replay
+ * (50.6 KB, 27,847) called tools at once. 100,000 sits a third under the
+ * smallest failing replay, so a cause that is the replayed toolless tail
+ * rather than the size (the other reading of the same log) is still caught
+ * at most a third earlier; a smaller toolless replay is logged, not
+ * compacted, since a short history is not what a compaction cures.
+ */
+const COMPACT_DEFAULT_TOKENS = 100_000;
+
+/**
+ * The compaction floor from CURSOR_BRIDGE_COMPACT_TOKENS: a whole number of
+ * tokens, 0 turning the ask off. Unset or empty is the default; anything else
+ * is the default too, and says so on stderr.
+ */
+function compactFloor(
+  raw: string | undefined,
+  warn: (message: string) => void = (m) => console.error(m),
+): number {
+  const text = (raw ?? "").trim();
+  if (!text) return COMPACT_DEFAULT_TOKENS;
+  if (/^\d+$/.test(text) && Number.isSafeInteger(Number(text))) return Number(text);
+  warn(`[bridge] CURSOR_BRIDGE_COMPACT_TOKENS=${JSON.stringify(raw)} is not a whole number of tokens; the compaction floor is the ${COMPACT_DEFAULT_TOKENS} default (0 turns it off)`);
+  return COMPACT_DEFAULT_TOKENS;
+}
+
 /** Run lifetimes, read at call time (tests shorten them). */
 const limits = {
   /**
@@ -502,6 +549,8 @@ const limits = {
   keptTtlMs: 12 * 60 * 60_000,
   /** A conversation whose blobs pass this many bytes is not kept (its next turn replays). */
   keptBlobBytes: 64 * 1024 * 1024,
+  /** A toolless fresh replay at or over this many estimated tokens asks the client to compact (0 = never). */
+  compactTokens: compactFloor(process.env.CURSOR_BRIDGE_COMPACT_TOKENS),
 };
 
 // --- H2 Bridge IPC ---
@@ -721,6 +770,8 @@ async function handleChatCompletion(
   }
 
   const promptTokens = requestTokens(body.messages, tools, true);
+  const asked = takeCompactAsk(chain);
+  if (asked) return compactResponse(asked, promptTokens);
   const mcpTools = buildMcpToolDefinitions(tools);
 
   // Patch (2026-09-16): TOOL RESULTS WERE SILENTLY DROPPED ON THE
@@ -865,12 +916,13 @@ function keepConversation(run: Run): void {
   const why = run.ended ? `the bridge ended it (${run.ended})`
     : run.failure ? `Cursor ended it with ${run.failure.message}`
     : run.pauseAfterChunk || run.awaiting.length || run.queued.length ? "a tool call is still waiting"
-    : run.toolless && !run.reachedTools ? `Cursor reported tool unavailable (${run.toolless}, and no tool call of this run reached the bridge)`
+    : run.toolless && !run.reachedTools ? `Cursor reported tool unavailable (${run.toolless}, and no tool call of this run reached the bridge) on ${replaySize(run)}`
     : !run.checkpoint ? "Cursor sent no checkpoint"
     : !run.chain || !run.conversationId ? "it has no client conversation"
     : "";
   if (why) {
     if (run.conversationId) console.error(`[bridge] run ${run.id}: Cursor conversation ${short(run.conversationId)} is not kept, since ${why}; the next request replays its history`);
+    if (run.toolless && !run.reachedTools) askCompaction(run);
     return;
   }
   const bytes = blobBytes(run.blobStore);
@@ -888,6 +940,74 @@ function keepConversation(run: Run): void {
   });
   pruneKept();
   trace(`run ${run.id} kept Cursor conversation ${short(run.conversationId!)} (${run.chain!.length - 1} messages, ${bytes} blob bytes)`);
+}
+
+/** What a run sent Cursor, for the toolless verdict: a fresh replay's size, or a continuation. */
+function replaySize(run: Run): string {
+  if (!run.replayed) return "a continuation of a kept conversation";
+  return `a fresh replay of ${(run.chain?.length ?? 1) - 1} messages (${kb(run.blobStore)}, about ${run.promptTokens} tokens)`;
+}
+
+/**
+ * Patch (2026-10-21): A TOOLLESS FRESH REPLAY ASKS THE
+ * CLIENT TO COMPACT. MEASURED on a live session (see COMPACT_DEFAULT_TOKENS):
+ * once the replayed history neared Cursor's window, every fresh replay came
+ * back toolless, and only a hand /compact cured it. The run's reply already
+ * reached the client, so the NEXT request on this history (one that extends
+ * it, or retries it) is answered 400 invalid_request_error "prompt is too
+ * long: N tokens > M maximum", the error Claude Code answers by compacting
+ * and resending the same request. VERIFIED 2026-10-21 against Claude Code
+ * 2.1.307 through a CLIProxyAPI 8.0.13 build: the 400 from
+ * an OpenAI-compatible upstream reached Claude Code as a 400 whose message
+ * keeps the text, the credential was not cooled down (a 400 is a request
+ * fault there), and Claude Code wrote a compact_boundary (trigger auto) and
+ * resent the prompt on the summary. Once per history: the ask is taken by the
+ * first request that meets it, so the compaction request and its retry pass,
+ * and a client that cannot compact sees the error once, never a loop.
+ */
+function askCompaction(run: Run): void {
+  if (!run.replayed || !run.chain) return;
+  const floor = limits.compactTokens;
+  if (!floor || run.promptTokens < floor) {
+    console.error(`[bridge] run ${run.id}: toolless on ${replaySize(run)}; ${floor ? `under the ${floor}-token compaction floor (CURSOR_BRIDGE_COMPACT_TOKENS)` : "compaction asks are off (CURSOR_BRIDGE_COMPACT_TOKENS=0)"}, so the client is not asked to compact`);
+    return;
+  }
+  pruneCompactAsks();
+  compactAsks.set(run.chain.at(-1)!, { run: run.id, tokens: run.promptTokens, messages: run.chain.length - 1, at: Date.now() });
+  console.error(`[bridge] run ${run.id}: toolless on ${replaySize(run)}, at or over the ${floor}-token compaction floor; the next request on this history is answered 400 "prompt is too long" once, so the client compacts`);
+}
+
+/** Drop compaction asks past the kept-conversation idle limit, then the oldest past its count limit. */
+function pruneCompactAsks(now = Date.now()): void {
+  for (const [key, ask] of compactAsks) {
+    if (now - ask.at > limits.keptTtlMs) compactAsks.delete(key);
+  }
+  const byAge = [...compactAsks.entries()].sort((a, b) => a[1].at - b[1].at);
+  while (byAge.length > limits.keptMax) compactAsks.delete(byAge.shift()![0]);
+}
+
+/** The compaction ask this request meets (its history extends or retries an asked one), taken so it fires once. */
+function takeCompactAsk(chain: string[]): CompactAsk | null {
+  pruneCompactAsks();
+  for (let n = chain.length - 1; n >= 1; n--) {
+    const ask = compactAsks.get(chain[n]!);
+    if (!ask) continue;
+    compactAsks.delete(chain[n]!);
+    return ask;
+  }
+  return null;
+}
+
+/** The 400 Claude Code reads as a prompt over the window (askCompaction). */
+function compactResponse(ask: CompactAsk, tokens: number): Response {
+  const floor = limits.compactTokens;
+  console.error(`[bridge] asking the client to compact: run ${ask.run} replayed ${ask.messages} messages (about ${ask.tokens} tokens) toolless; this request (about ${tokens} tokens) is answered 400 "prompt is too long" once`);
+  const message = `prompt is too long: ${Math.max(tokens, floor + 1)} tokens > ${floor} maximum `
+    + `(cursor bridge: Cursor answered a fresh replay of this history, ${ask.messages} messages, without its tools; compact the conversation and retry)`;
+  return new Response(
+    JSON.stringify({ error: { message, type: "invalid_request_error", code: "context_length_exceeded" } }),
+    { status: 400, headers: { "Content-Type": "application/json" } },
+  );
 }
 
 // --- Message Parsing ---
@@ -2624,6 +2744,7 @@ async function startRun(
     chain: payload.chain,
     ended: null,
     sent: { request: payload.requestBytes.length, answers: 0, blobs: 0, blobBytes: 0 },
+    replayed: !continued,
   };
   trace(`run ${run.id} started (${modelId})`);
   if (continued) {
@@ -3369,4 +3490,4 @@ function jsonResponse(run: Run, then: () => void): Promise<Response> {
 
 // Test surface (2026-09-16): the first-frame peek and the refusal matcher
 // are exported for test/refusal-to-429.test.ts only.
-export const __test = { IDLE_TIMEOUT_S, IDLE_MARGIN_MS, stallWindow, requestTokens, handleChatCompletion, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages, seams, keptConversations, messageChain, continuation, buildContinuation, mcpInstructionsFor };
+export const __test = { IDLE_TIMEOUT_S, compactAsks, compactFloor, IDLE_MARGIN_MS, stallWindow, requestTokens, handleChatCompletion, peekFirstFrame, connectRefusal, handleExecMessage, clientToolCallId, respond, listen, findPausedRun, takePausedRun, stampConversation, resumeRun, pausedRuns, limits, toHistory, buildCursorRequest, parseMessages, seams, keptConversations, messageChain, continuation, buildContinuation, mcpInstructionsFor };

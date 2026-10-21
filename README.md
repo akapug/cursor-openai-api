@@ -144,6 +144,7 @@ const chat = await client.chat.completions.create({
 | `CURSOR_BRIDGE_TRACE` | unset (off) | Set to `1` to log every frame Cursor sends to stderr, with a timestamp, including the field numbers of messages the bundled proto does not know. |
 | `CURSOR_BRIDGE_STALL_MS` | `90000` | Stall window in milliseconds: a run is ended when Cursor sends nothing at all for this long, or only heartbeats while one of its tool calls is open. Held between `30000` and `225000` with a warning; a value that is not a whole number keeps the default with a warning. |
 | `CURSOR_BRIDGE_TOOL_UNAVAILABLE` | `tool not available` | Phrase (matched case-insensitively) that marks a run whose tools Cursor reported unavailable. Such a run's conversation is not kept, so the next request replays the history. Change it if Cursor rewords the message. |
+| `CURSOR_BRIDGE_COMPACT_TOKENS` | `100000` | When a run that replayed the full history into a new Cursor conversation comes back without using its tools, and the request was at least this many estimated tokens, the next request on that history is answered once with HTTP `400` "prompt is too long", which makes Claude Code compact the conversation and resend. `0` turns this off; a value that is not a whole number keeps the default with a warning. |
 
 ## What this fork adds
 
@@ -171,6 +172,11 @@ Every change below has a regression test in `test/`.
   Cursor's own conversation (its checkpoint and conversation id) and sends just
   the new user text. A compaction, `/clear`, an edited history or a run that
   did not end cleanly replays the full history instead, and the log says why.
+- A long history replayed into a new Cursor conversation can come back with
+  the model reporting its tools unavailable. Such a run's conversation is not
+  kept, the log names the replay's size, and above `CURSOR_BRIDGE_COMPACT_TOKENS`
+  the next request on that history gets one `400` "prompt is too long" so that
+  Claude Code compacts the conversation and resends it.
 - A paused run is found by the ids of the tool calls it handed out, so a main
   conversation and its subagents never resume each other's runs. A paused run
   nobody resumes is ended after 15 minutes.

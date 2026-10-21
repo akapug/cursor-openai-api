@@ -69,6 +69,7 @@ afterEach(() => {
   __test.seams.spawn = realSpawn;
   Object.assign(__test.limits, saved);
   __test.keptConversations.clear();
+  __test.compactAsks.clear();
   __test.pausedRuns.clear();
 });
 
@@ -419,6 +420,115 @@ describe("a replay, and the log says why", () => {
     expect(__test.keptConversations.size).toBe(1);
     const two = await turn([...FIRST, { role: "assistant", content: "noted" }, { role: "user", content: "next" }], frame(textDelta("ok")));
     expect(runRequest(two.fb).req.conversationState!.turns.length).toBe(0);
+  });
+});
+
+// Regression test (2026-10-21): A TOOLLESS FRESH REPLAY ASKS THE CLIENT
+// TO COMPACT. MEASURED on a live session: fresh replays of 376-380 messages
+// (about 154,000 estimated tokens) came back toolless until a hand /compact.
+// The next request on that history is answered 400 "prompt is too long" once,
+// the error Claude Code answers by compacting and resending.
+describe("a toolless fresh replay asks the client to compact", () => {
+  const TOOLLESS = "Tool not available";
+  const after = (said: string, next = "go on"): Msg[] => [...FIRST, { role: "assistant", content: said }, { role: "user", content: next }];
+
+  test("the next request on that history is answered 400 prompt is too long, once, without reaching Cursor", async () => {
+    __test.limits.compactTokens = 1;
+    const one = await turn(FIRST, checkpointFrame("t1"), frame(textDelta(`The shell returned ${TOOLLESS}.`)));
+    const id = runRequest(one.fb).req.conversationId;
+    expect(logged.some((l) => l.includes(`Cursor conversation ${id.slice(0, 8)} is not kept, since Cursor reported tool unavailable (its reply says "tool not available", and no tool call of this run reached the bridge) on a fresh replay of 2 messages (`))).toBe(true);
+    expect(logged.some((l) => l.includes("at or over the 1-token compaction floor; the next request on this history is answered 400"))).toBe(true);
+    expect(__test.compactAsks.size).toBe(1);
+
+    const spawned = bridges.length;
+    const resp = await ask(after(`The shell returned ${TOOLLESS}.`));
+    expect(resp.status).toBe(400);
+    const body = await resp.json() as { error: { message: string; type: string; code: string } };
+    expect(body.error.type).toBe("invalid_request_error");
+    expect(body.error.code).toBe("context_length_exceeded");
+    // the shape Claude Code parses: prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)
+    const m = body.error.message.match(/prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i)!;
+    expect(Number(m[1])).toBeGreaterThan(Number(m[2]));
+    expect(Number(m[2])).toBe(1);
+    expect(bridges.length).toBe(spawned);
+    expect(__test.compactAsks.size).toBe(0);
+
+    // the compaction request (the same history, extended) and the resend after it reach Cursor
+    const summary = await turn([...after(`The shell returned ${TOOLLESS}.`), { role: "user", content: "Summarize the conversation." }], frame(textDelta("summary")));
+    expect(summary.sse.content).toBe("summary");
+    const compacted: Msg[] = [SYSTEM, { role: "user", content: "This session is being continued from a previous conversation. Summary: ..." }, { role: "user", content: "go on" }];
+    const resent = await turn(compacted, frame(mcpCall(1, "call-1", "ls")));
+    expect(resent.sse.finish).toBe("tool_calls");
+  });
+
+  test("a retry of the same history meets the ask too, and only once", async () => {
+    __test.limits.compactTokens = 1;
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta(TOOLLESS)));
+    expect((await ask(FIRST)).status).toBe(400);
+    const again = await turn(FIRST, frame(textDelta("noted")));
+    expect(again.sse.content).toBe("noted");
+  });
+
+  test("another history is not asked", async () => {
+    __test.limits.compactTokens = 1;
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta(TOOLLESS)));
+    const other = await turn([SYSTEM, { role: "user", content: "a subagent's task" }], frame(textDelta("done")));
+    expect(other.sse.content).toBe("done");
+    expect(__test.compactAsks.size).toBe(1);
+  });
+
+  test("a toolless replay under the floor is logged with its size and asks nothing", async () => {
+    expect(__test.limits.compactTokens).toBe(100_000);
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta(TOOLLESS)));
+    expect(__test.compactAsks.size).toBe(0);
+    expect(logged.some((l) => /toolless on a fresh replay of 2 messages \([\d.]+ KB, about \d+ tokens\); under the 100000-token compaction floor \(CURSOR_BRIDGE_COMPACT_TOKENS\)/.test(l))).toBe(true);
+    const two = await turn(after(TOOLLESS), frame(textDelta("ok")));
+    expect(two.sse.content).toBe("ok");
+  });
+
+  test("a floor of 0 turns the ask off", async () => {
+    __test.limits.compactTokens = 0;
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta(TOOLLESS)));
+    expect(__test.compactAsks.size).toBe(0);
+    expect(logged.some((l) => l.includes("compaction asks are off (CURSOR_BRIDGE_COMPACT_TOKENS=0)"))).toBe(true);
+  });
+
+  test("a toolless continuation asks nothing: compacting is the cure for a replayed history", async () => {
+    __test.limits.compactTokens = 1;
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta("noted")));
+    await turn(after("noted"), checkpointFrame("t2"), frame(textDelta(TOOLLESS)));
+    expect(__test.compactAsks.size).toBe(0);
+    expect(logged.some((l) => l.includes("no tool call of this run reached the bridge) on a continuation of a kept conversation"))).toBe(true);
+  });
+
+  test("a fresh replay whose tool calls reach the bridge asks nothing", async () => {
+    __test.limits.compactTokens = 1;
+    const pending = ask(FIRST);
+    const fb = bridges.at(-1)!;
+    fb.feed(checkpointFrame("t1"), frame(textDelta(`quoting ${TOOLLESS}`)), frame(mcpCall(1, "call-1", "ls")));
+    expect((await readSse(await pending)).finish).toBe("tool_calls");
+    fb.close(0);
+    expect(__test.compactAsks.size).toBe(0);
+  });
+
+  test("past the idle limit an ask is dropped", async () => {
+    __test.limits.compactTokens = 1;
+    await turn(FIRST, checkpointFrame("t1"), frame(textDelta(TOOLLESS)));
+    __test.limits.keptTtlMs = -1;
+    const two = await turn(after(TOOLLESS), frame(textDelta("ok")));
+    expect(two.sse.content).toBe("ok");
+  });
+
+  test("CURSOR_BRIDGE_COMPACT_TOKENS: a whole number, 0 for off, anything else the default with a warning", () => {
+    const warned: string[] = [];
+    const warn = (m: string) => { warned.push(m); };
+    expect(__test.compactFloor(undefined, warn)).toBe(100_000);
+    expect(__test.compactFloor(" ", warn)).toBe(100_000);
+    expect(__test.compactFloor("120000", warn)).toBe(120_000);
+    expect(__test.compactFloor("0", warn)).toBe(0);
+    expect(warned).toEqual([]);
+    expect(__test.compactFloor("90k", warn)).toBe(100_000);
+    expect(warned[0]).toContain('CURSOR_BRIDGE_COMPACT_TOKENS="90k"');
   });
 });
 
